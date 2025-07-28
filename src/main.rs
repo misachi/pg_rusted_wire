@@ -428,7 +428,7 @@ mod sasl {
             stream: &mut TcpStream,
             auth_type: &[u8],
         ) -> Result<(), String> {
-            let pass = normalize_password(&self.password);
+            let pass = normalize_password(&self.retrieve_password().unwrap());
 
             let buf = self.initial_response_body(auth_type, &self.user, &self.nonce);
 
