@@ -127,23 +127,39 @@ pub fn get_auth_type(_type: &[u8]) -> AuthenticationType {
     // This function is a placeholder for determining the authentication type
     // In a real implementation, this would likely involve a bit more complex logic
     if _type == b"md5\0" {
-        println!("Received MD5 Authentication message");
         AuthenticationType::MD5Password
     } else if _type == b"SCRAM-SHA-256" {
-        println!("Received SASL Authentication message");
         AuthenticationType::SASL
     } else if _type == b"c\0\0\0" {
-        println!("Received Cleartext Password Authentication message");
         AuthenticationType::CleartextPassword
     } else {
         panic!("Unknown authentication type: {:?}", _type);
     }
 }
 
+/// Add length to specified position in the buffer
 fn add_buf_len(buf: &mut BytesMut, start_pos: usize, buf_len: i32) {
     let mut temp_buf = vec![];
     temp_buf.put_i32(buf_len);
     buf[start_pos..start_pos + 4].copy_from_slice(&temp_buf);
+}
+
+/// Example function for how data rows will be formatted
+/// Each column will be separated by '|' and rows will be
+/// separated by newline '\n' character e.g `1|1\n`
+fn format_data_row(off: usize, num_cols: i16, resp_buf: &[u8], out_buf: &mut BytesMut) {
+    let mut off = off; // coerce offset to mutable type
+    for i in 0..num_cols {
+        let col_len = (&resp_buf[off..off + 4]).get_i32();
+        off += 4;
+        let row_data = &resp_buf[off..off + col_len as usize];
+        out_buf.put_slice(row_data);
+        if (i + 1) < num_cols {
+            out_buf.put_i8(b'|' as i8);
+        }
+        off += col_len as usize;
+    }
+    out_buf.put_u8(b'\n'); // Add newline for better readability
 }
 
 pub fn process_simple_query(
@@ -218,7 +234,6 @@ pub fn process_simple_query(
                             let row_desc: &[u8] = &buf[7..msg_len as usize];
 
                             row_descr.put_slice(row_desc);
-                            row_descr.put_u8(b'\n'); // Add newline for better readability
 
                             size = if size > msg_len as usize {
                                 size - msg_len as usize - 1
@@ -232,34 +247,39 @@ pub fn process_simple_query(
                             let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
 
                             // Check if the message length exceeds the available data
+                            // If so, put in overflow buffer to be handled later
                             if off + msg_len as usize + 1 > cpy_size {
                                 overflowed = true;
                                 overflow_buf.put_slice(&buf[off..]);
                                 skip_bytes = (msg_len + 1) - buf[off..].len() as i32;
-                                buf.fill(0);
+                                buf.fill(0); // We'll need to reuse buffer
                                 break;
                             }
-                            let row_data: &[u8] = &buf[off + 7..off + msg_len as usize];
+                            let num_cols = (&buf[off + 5..off + 7]).get_i16();
+
+                            let val_off = off + 5 + 2; // Account for byte, 4 byte for content size, 2 bytes for column number
+                            format_data_row(val_off, num_cols, &buf, data_buf);
+
                             size = if size > msg_len as usize {
                                 size - msg_len as usize - 1
                             } else {
                                 0
                             };
                             off += msg_len as usize + 1;
-                            data_buf.put_slice(row_data);
-                            data_buf.put_u8(b'\n'); // Optional; Add newline for better readability
                         }
                         _ => {
+                            // Handle incomplete data in read buffer
                             if overflowed {
                                 overflow_buf.put_slice(&buf[..skip_bytes as usize]);
-                                let msg_len: i32 = (&overflow_buf[1..5]).get_i32();
-                                let row_data: &[u8] = &overflow_buf[7..msg_len as usize];
 
                                 size -= skip_bytes as usize;
                                 off += skip_bytes as usize;
 
-                                data_buf.put_slice(row_data);
-                                data_buf.put_u8(b'\n');
+                                let num_cols = (&overflow_buf[5..7]).get_i16();
+
+                                let val_off = 5 + 2; // Account for byte, 4 byte for content size, 2 bytes for column number
+                                format_data_row(val_off, num_cols, &overflow_buf, data_buf);
+
                                 overflow_buf.clear();
                                 overflowed = false;
                                 skip_bytes = 0;
