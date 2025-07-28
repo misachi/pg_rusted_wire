@@ -406,16 +406,37 @@ mod sasl {
         }
 
         pub fn handle_sasl_auth_ok(&self, stream: &mut TcpStream) -> Result<(), String> {
-            let mut buf2 = [0; BUF_LEN];
-            match stream.read(&mut buf2) {
+            let mut buf = [0; BUF_LEN];
+            match stream.read(&mut buf) {
                 Ok(size) => {
-                    let response = &buf2[..size];
-                    // TODO: Handle the response from the server instead of just printing it.
-                    // There are 2 responses that can be received here.
-                    println!(
-                        "Received SASL response: {:?}",
-                        String::from_utf8_lossy(response)
-                    );
+                    let mut response = &buf[..size];
+                    if response[0] != b'R' {
+                        return Err(format!(
+                            "Invalid responce in AuthenticationSASLFinal message: {:?}",
+                            response[0]
+                        ));
+                    }
+
+                    let msg_len: i32 = (&buf[1..5]).get_i32();
+                    let mut complete_tag = (&buf[5..9]).get_i32();
+                    if complete_tag != 12 {
+                        // 12 signifies SASL authentication has completed(AuthenticationSASLFinal)
+                        return Err(format!("Auth incomplete: {}", complete_tag));
+                    }
+
+                    response = &buf[msg_len as usize + 1..size];
+                    if response[0] != b'R' {
+                        return Err(format!(
+                            "Invalid responce in AuthenticationOk message: {:?}",
+                            response[0]
+                        ));
+                    }
+
+                    complete_tag = (&response[5..9]).get_i32();
+                    if complete_tag != 0 {
+                        // 0 signifies SASL authentication was successful(AuthenticationOk )
+                        return Err(format!("Auth incomplete: {}", complete_tag));
+                    }
                 }
                 Err(e) => return Err(format!("Final Authentication Error: {}", e)),
             }
