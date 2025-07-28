@@ -8,7 +8,7 @@ pub const PROTOCOL_VERSION: i32 = 196608; // 3.0.0 in PostgreSQL protocol versio
 pub const BUF_LEN: usize = 1024; // Buffer size for reading from the stream
 pub const DEFAULT_USER: &str = "postgres";
 pub const DEFAULT_PORT: u16 = 5432;
-pub const DEFAULT_IP: &str = "172.17.0.2";
+pub const DEFAULT_IP: &str = "127.0.0.1";
 
 #[derive(Debug)]
 struct StartupMsg {
