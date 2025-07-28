@@ -48,8 +48,8 @@ impl Client {
         &self,
         stream: &mut TcpStream,
         startup_msg: &mut StartupMsg,
+        pass: &str
     ) -> Result<(), String> {
-        // if let Some(ref mut stream) = client.stream {
         let msg_bytes = startup_msg.to_bytes();
         let mut buf = [0; BUF_LEN]; // Buffer to read response
 
@@ -84,7 +84,7 @@ impl Client {
                                     println!("Authentication: MD5Password")
                                 }
                                 AuthenticationType::SASL => {
-                                    let sasl = sasl::SASL::new(DEFAULT_USER, DEFAULT_USER);
+                                    let sasl = sasl::SASL::new(&pass, &startup_msg.user);
                                     match sasl.handle_sasl_authentication(stream, &auth_type) {
                                         Ok(_) => {
                                             if let Err(e) = sasl.handle_sasl_auth_ok(stream) {
@@ -574,13 +574,13 @@ fn main() {
 
     match client.connect() {
         Ok(mut stream) => {
-            if let Err(e) = client.authenticate(&mut stream, &mut startup_msg) {
+            if let Err(e) = client.authenticate(&mut stream, &mut startup_msg, DEFAULT_USER) {
                 eprintln!("Client Authentication: {}", e);
                 return;
             }
-            
+
             // Okay to use stream to send queries at this point
-            let mut msg = "SELECT * FROM foo;";  // First Query
+            let mut msg = "SELECT * FROM foo;"; // First Query
             let result_buf = &mut BytesMut::new();
             let row_descr = &mut BytesMut::new();
 
