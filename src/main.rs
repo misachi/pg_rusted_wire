@@ -367,14 +367,16 @@ mod sasl {
             pass: &[u8],
             stream: &mut TcpStream,
             resp_data: &[u8],
-        ) -> std::io::Result<()> {
+        ) -> Result<(), String> {
             let resp_str = String::from_utf8(resp_data.to_vec());
             if let Ok(val) = resp_str {
                 let data = val.split(',').collect::<Vec<&str>>();
                 let server_nonce = &data[0][2..];
                 let decoded_salt = match STANDARD.decode(&data[1][2..]) {
                     Ok(s) => s,
-                    Err(e) => panic!("Failed to decode salt: {}", e),
+                    Err(e) => {
+                        return Err(format!("Decoding error: {}", e));
+                    }
                 };
 
                 let iterations = &data[2][2..].parse::<usize>().unwrap_or_else(|_| 4096);
@@ -396,16 +398,11 @@ mod sasl {
                 let buf = self.sasl_response_body(server_nonce, &client_proof);
 
                 if let Err(e) = stream.write(&buf) {
-                    eprintln!("Failed to write to stream for client SASL response: {}", e);
-                    return Err(e);
+                    return Err(format!("Failed to write to stream for client SASL response: {}", e));
                 }
                 Ok(())
             } else {
-                eprintln!("Failed to parse response data: {:?}", resp_str);
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Invalid response data",
-                ))
+                return Err(format!("Failed to parse response data: {:?}", resp_str));
             }
         }
 
