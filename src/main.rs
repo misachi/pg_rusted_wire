@@ -62,12 +62,10 @@ impl Client {
                 Ok(size) => {
                     if size <= 0 {
                         return Err(format!("Server closed the connection"));
-                        // break;
                     }
 
                     if size > BUF_LEN {
                         return Err(format!("Received data exceeds buffer size"));
-                        // break;
                     }
                     let response = &buf[..size];
 
@@ -103,10 +101,6 @@ impl Client {
                                     }
                                 }
                             }
-                        }
-                        0x4E => {
-                            // 'N' for Negotiate
-                            println!("Received Negotiate message");
                         }
                         _ => {
                             return Err(format!("Unexpected message type: {}", response[0]));
