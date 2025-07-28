@@ -322,9 +322,17 @@ mod sasl {
     impl SASL {
         pub fn new(password: &str, user: &str) -> Self {
             SASL {
-                password: password.to_string(),
+                // password: String::from_utf8(normalize_password(password)).expect("Unable to normalize password"),
+                password: STANDARD.encode(password),
                 user: user.to_string(),
                 nonce: STANDARD.encode(rand::random::<[u8; 24]>()), // Random nonce
+            }
+        }
+
+        fn retrieve_password(&self) -> Option<String> {
+            match STANDARD.decode(&self.password) {
+                Ok(pass) => Some(String::from_utf8_lossy(&pass).to_string()),
+                Err(_) => None,
             }
         }
 
