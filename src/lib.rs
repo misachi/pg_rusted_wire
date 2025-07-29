@@ -321,6 +321,79 @@ pub fn process_simple_query(
     Ok(())
 }
 
+mod textpassword {
+    use bytes::{Buf, BufMut, BytesMut};
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    use crate::{BUF_LEN, add_buf_len, decoded_password, encode_password};
+
+    #[derive(Debug)]
+    pub struct ClearTextPass {
+        password: String,
+    }
+
+    impl ClearTextPass {
+        pub fn new(password: &str, _user: &str) -> Self {
+            ClearTextPass {
+                password: encode_password(password),
+            }
+        }
+        pub fn authenticate(&self, stream: &mut TcpStream) -> Result<(), String> {
+            let mut buf = BytesMut::with_capacity(BUF_LEN);
+            buf.put_u8(b'p'); // identify message as PasswordMessage
+
+            let start_pos = buf.len();
+            buf.put_i32(0); // Placeholder for length
+            buf.put_slice(
+                decoded_password(&self.password)
+                    .expect("Could not decode password")
+                    .as_bytes(),
+            );
+            buf.put_u8(0); // Terminate password string
+
+            let total_len = buf[start_pos..].len() as i32;
+            add_buf_len(&mut buf, start_pos, total_len);
+
+            if let Err(e) = stream.write(&buf) {
+                return Err(format!(
+                    "Failed to write to stream for clear text password initial response: {}",
+                    e
+                ));
+            }
+
+            buf.fill(0);
+            match stream.read(&mut buf) {
+                Ok(size) => {
+                    let response = &buf[..size];
+
+                    if response[0] != b'R' {
+                        return Err(format!(
+                            "Invalid response in AuthenticationOk message: {:?}",
+                            response[0]
+                        ));
+                    }
+
+                    let complete_tag = (&response[5..9]).get_i32(); // Check 4 byte value for completion status
+                    if complete_tag != 0 {
+                        // 0 signifies SASL authentication was successful(AuthenticationOk )
+                        return Err(format!("Auth incomplete: {}", complete_tag));
+                    }
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to read from stream for AuthenticationOk: {}",
+                        e
+                    ));
+                }
+            }
+
+            return Ok(());
+        }
+    }
+}
+
+
 mod sasl {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
