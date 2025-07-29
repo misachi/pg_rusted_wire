@@ -70,33 +70,23 @@ impl Client {
                     match response[0] {
                         b'R' => {
                             // 'R' for Authentication
-                            let msg_len: i32 = (&buf[1..5]).get_i32();
-                            let auth_type: &[u8] = &buf[9..msg_len as usize - 1];
-                            let _val = &buf[5..9];
+                            let auth_type_num = (&buf[5..9]).get_i32();
 
-                            match get_auth_type(auth_type) {
+                            match get_auth_type(auth_type_num) {
                                 AuthenticationType::CleartextPassword => {
-                                    println!("Authentication: CleartextPassword")
+                                    let auth =
+                                        textpassword::ClearTextPass::new(&pass, &startup_msg.user);
+                                    auth.authenticate(stream)?;
+                                    break;
                                 }
                                 AuthenticationType::MD5Password => {
-                                    println!("Authentication: MD5Password")
+                                    println!("Authentication: MD5Password");
+                                    return Ok(());
                                 }
                                 AuthenticationType::SASL => {
-                                    let sasl = sasl::SASL::new(&pass, &startup_msg.user);
-                                    match sasl.handle_sasl_authentication(stream, &auth_type) {
-                                        Ok(_) => {
-                                            if let Err(e) = sasl.handle_sasl_auth_ok(stream) {
-                                                return Err(format!("Final Auth: {}", e));
-                                            }
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            return Err(format!(
-                                                "Error handling SASL authentication: {}",
-                                                e
-                                            ));
-                                        }
-                                    }
+                                    let auth = sasl::SASL::new(&pass, &startup_msg.user);
+                                    auth.authenticate(stream)?;
+                                    break;
                                 }
                             }
                         }
