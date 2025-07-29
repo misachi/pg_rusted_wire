@@ -591,6 +591,21 @@ mod sasl {
             }
             Ok(())
         }
+
+        pub fn authenticate(&self, stream: &mut TcpStream) -> Result<(), String> {
+            let auth_type_text: &[u8] = b"SCRAM-SHA-256";
+            match self.handle_sasl_authentication(stream, &auth_type_text) {
+                Ok(_) => {
+                    if let Err(e) = self.handle_sasl_auth_ok(stream) {
+                        return Err(format!("Final Auth: {}", e));
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    return Err(format!("Error handling SASL authentication: {}", e));
+                }
+            }
+        }
     }
 
     fn hi(normalized_password: &[u8], salt: &[u8], iterations: usize) -> Vec<u8> {
