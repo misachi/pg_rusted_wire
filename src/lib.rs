@@ -2,6 +2,8 @@ use bytes::{Buf, BufMut, BytesMut};
 use std::fmt::Debug;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 
 const BUF_LEN: usize = 1024; // Buffer size for reading from the stream
 const PROTOCOL_VERSION: i32 = 196608; // 3.0.0 in PostgreSQL protocol versioning
@@ -110,6 +112,17 @@ impl Client {
         }
         Ok(())
     }
+}
+
+fn decoded_password(password: &str) -> Option<String> {
+    match STANDARD.decode(&password) {
+        Ok(pass) => Some(String::from_utf8_lossy(&pass).to_string()),
+        Err(_) => None,
+    }
+}
+
+fn encode_password(password: &str) -> String {
+    STANDARD.encode(password)
 }
 
 pub enum AuthenticationType {
@@ -319,8 +332,7 @@ mod sasl {
     use std::net::TcpStream;
     use std::ops::BitXor;
 
-    use crate::BUF_LEN;
-    use crate::add_buf_len;
+    use crate::{BUF_LEN, add_buf_len, decoded_password, encode_password};
 
     #[derive(Debug)]
     pub struct SASL {
@@ -333,17 +345,14 @@ mod sasl {
         pub fn new(password: &str, user: &str) -> Self {
             SASL {
                 // password: String::from_utf8(normalize_password(password)).expect("Unable to normalize password"),
-                password: STANDARD.encode(password),
+                password: encode_password(password),
                 user: user.to_string(),
                 nonce: STANDARD.encode(rand::random::<[u8; 24]>()), // Random nonce
             }
         }
 
         fn retrieve_password(&self) -> Option<String> {
-            match STANDARD.decode(&self.password) {
-                Ok(pass) => Some(String::from_utf8_lossy(&pass).to_string()),
-                Err(_) => None,
-            }
+            decoded_password(&self.password)
         }
 
         fn initial_response_body(&self, auth_type: &[u8], user: &str, nonce: &str) -> BytesMut {
