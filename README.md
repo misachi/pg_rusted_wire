@@ -6,7 +6,7 @@ Postgres Wire Protocol implemented in Rust. Currently supports SASL `SCRAM-SHA-2
 
 Having an entry like this in your `pg_hba.conf` file
 ```
-host <database> <user> <ip_address>/24 md5  # replace <database>, <user> and <ip_address> appropriately
+host <database> <user> <ip_address>/24 <auth>  # replace <database>, <user> and <ip_address> appropriately. <auth> should be one of (SCRAM-SHA-256, password)
 ```
 
 Instantiate `StartupMsg` with message details
