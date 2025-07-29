@@ -286,7 +286,7 @@ pub fn process_simple_query(
                             } else {
                                 let msg_len: i32 = (&buf[1..5]).get_i32();
                                 eprintln!(
-                                    "Unexpected message type: {:?}",
+                                    "Unexpected message type when processing simple query: {:?}",
                                     String::from_utf8_lossy(&buf[0].to_le_bytes())
                                 );
                                 size = if size >= msg_len as usize {
@@ -425,14 +425,14 @@ mod sasl {
             }
         }
 
-        pub fn handle_sasl_auth_ok(&self, stream: &mut TcpStream) -> Result<(), String> {
+        fn handle_sasl_auth_ok(&self, stream: &mut TcpStream) -> Result<(), String> {
             let mut buf = [0; BUF_LEN];
             match stream.read(&mut buf) {
                 Ok(size) => {
                     let mut response = &buf[..size];
                     if response[0] != b'R' {
                         return Err(format!(
-                            "Invalid responce in AuthenticationSASLFinal message: {:?}",
+                            "Invalid response in AuthenticationSASLFinal message: {:?}",
                             response[0]
                         ));
                     }
@@ -441,13 +441,13 @@ mod sasl {
                     let mut complete_tag = (&buf[5..9]).get_i32();
                     if complete_tag != 12 {
                         // 12 signifies SASL authentication has completed(AuthenticationSASLFinal)
-                        return Err(format!("Auth incomplete: {}", complete_tag));
+                        return Err(format!("Authentication incomplete: {}", complete_tag));
                     }
 
                     response = &buf[msg_len as usize + 1..size];
                     if response[0] != b'R' {
                         return Err(format!(
-                            "Invalid responce in AuthenticationOk message: {:?}",
+                            "Invalid response in AuthenticationOk message: {:?}",
                             response[0]
                         ));
                     }
@@ -455,7 +455,7 @@ mod sasl {
                     complete_tag = (&response[5..9]).get_i32();
                     if complete_tag != 0 {
                         // 0 signifies SASL authentication was successful(AuthenticationOk )
-                        return Err(format!("Auth incomplete: {}", complete_tag));
+                        return Err(format!("Authentication incomplete: {}", complete_tag));
                     }
                 }
                 Err(e) => return Err(format!("Final Authentication Error: {}", e)),
@@ -463,12 +463,13 @@ mod sasl {
             Ok(())
         }
 
-        pub fn handle_sasl_authentication(
+        fn handle_sasl_authentication(
             &self,
             stream: &mut TcpStream,
             auth_type: &[u8],
         ) -> Result<(), String> {
-            let pass = normalize_password(&self.retrieve_password().unwrap());
+            let pass =
+                normalize_password(&self.retrieve_password().expect("Could not decode password"));
 
             let buf = self.initial_response_body(auth_type, &self.user, &self.nonce);
 
