@@ -136,14 +136,14 @@ pub fn put_cstring(buf: &mut BytesMut, input: &str) {
     buf.put_u8(b'\0');
 }
 
-pub fn get_auth_type(_type: &[u8]) -> AuthenticationType {
+pub fn get_auth_type(_type: i32) -> AuthenticationType {
     // This function is a placeholder for determining the authentication type
     // In a real implementation, this would likely involve a bit more complex logic
-    if _type == b"md5\0" {
+    if _type == 5 {
         AuthenticationType::MD5Password
-    } else if _type == b"SCRAM-SHA-256" {
+    } else if _type == 10 {
         AuthenticationType::SASL
-    } else if _type == b"c\0\0\0" {
+    } else if _type == 3 {
         AuthenticationType::CleartextPassword
     } else {
         panic!("Unknown authentication type: {:?}", _type);
