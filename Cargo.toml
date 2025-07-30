@@ -12,6 +12,8 @@ rand = "0.9.2"
 rand_core = { version = "0.6", features = ["std"] }
 sha2 = "0.10.9"
 stringprep = "0.1.5"
+md-5 = "0.10.6"
+hex = "0.4"
 
 [lib]
 name = "pg_rusted_wire"

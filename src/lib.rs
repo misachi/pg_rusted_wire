@@ -1,9 +1,9 @@
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use bytes::{Buf, BufMut, BytesMut};
 use std::fmt::Debug;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 
 const BUF_LEN: usize = 1024; // Buffer size for reading from the stream
 const PROTOCOL_VERSION: i32 = 196608; // 3.0.0 in PostgreSQL protocol versioning
@@ -76,16 +76,19 @@ impl Client {
                                 AuthenticationType::CleartextPassword => {
                                     let auth =
                                         textpassword::ClearTextPass::new(&pass, &startup_msg.user);
-                                    auth.authenticate(stream)?;
+                                    auth.authenticate(stream, &buf)?;
                                     break;
                                 }
                                 AuthenticationType::MD5Password => {
                                     println!("Authentication: MD5Password");
-                                    return Ok(());
+                                    let auth =
+                                        md5password::MD5Pass::new(&pass, &startup_msg.user);
+                                    auth.authenticate(stream, &buf)?;
+                                    break;
                                 }
                                 AuthenticationType::SASL => {
                                     let auth = sasl::SASL::new(&pass, &startup_msg.user);
-                                    auth.authenticate(stream)?;
+                                    auth.authenticate(stream, &buf)?;
                                     break;
                                 }
                             }
@@ -311,6 +314,106 @@ pub fn process_simple_query(
     Ok(())
 }
 
+mod md5password {
+    use bytes::{Buf, BufMut, BytesMut};
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use md5::{Md5, Digest};
+
+    use crate::{BUF_LEN, add_buf_len, decoded_password, encode_password};
+
+    #[derive(Debug)]
+    pub struct MD5Pass {
+        password: String,
+        user: String
+    }
+
+    impl MD5Pass {
+        pub fn new(password: &str, _user: &str) -> Self {
+            MD5Pass {
+                password: encode_password(password),
+                user: _user.to_string()
+            }
+        }
+
+        /// Generate MD5 string to authenticate. See AuthenticationMD5Password in
+        /// https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-START-UP
+        /// Postgres does checks in  md5_crypt_verify in src/backend/libpq/crypt.c
+        fn hash(&self, salt: &[u8]) -> Vec<u8> {
+            // The final string is generated in SQL as
+            // concat('md5', md5(concat(md5(concat(password, username)), random-salt))) with
+            // md5() function returning a hex string
+
+            let mut ret_vec = vec![];
+            let mut hasher = Md5::new();
+            ret_vec.put_slice(decoded_password(&self.password).expect("md5: Could not decode password").as_bytes());
+            ret_vec.put_slice(self.user.as_bytes());
+            hasher.update(&ret_vec);
+
+            let mut res = hasher.finalize().to_vec();
+            hasher = Md5::new();
+            ret_vec.clear();
+            ret_vec.put_slice(hex::encode(&res).as_bytes());
+            ret_vec.put_slice(salt);
+            hasher.update(&ret_vec[..]);
+
+            res = hasher.finalize().to_vec();
+            ret_vec.clear();
+            ret_vec.put_slice(b"md5");
+            ret_vec.put_slice(hex::encode(&res).as_bytes());
+            ret_vec
+        }
+
+        pub fn authenticate(&self, stream: &mut TcpStream, _read_buf: &[u8]) -> Result<(), String> {
+            let mut buf = BytesMut::with_capacity(BUF_LEN);
+            buf.put_u8(b'p'); // identify message as PasswordMessage
+
+            let start_pos = buf.len();
+            buf.put_i32(0); // Placeholder for length
+            buf.put_slice(&self.hash(&_read_buf[9..13]));
+            buf.put_u8(0); // Terminate password string
+
+            let total_len = buf[start_pos..].len() as i32;
+            add_buf_len(&mut buf, start_pos, total_len);
+
+            if let Err(e) = stream.write(&buf) {
+                return Err(format!(
+                    "Failed to write to stream for clear text password initial response: {}",
+                    e
+                ));
+            }
+
+            buf.fill(0);
+            match stream.read(&mut buf) {
+                Ok(size) => {
+                    let response = &buf[..size];
+
+                    if response[0] != b'R' {
+                        return Err(format!(
+                            "Invalid response in AuthenticationOk message: {:?}",
+                            response[0]
+                        ));
+                    }
+
+                    let complete_tag = (&response[5..9]).get_i32(); // Check 4 byte value for completion status
+                    if complete_tag != 0 {
+                        // 0 signifies SASL authentication was successful(AuthenticationOk )
+                        return Err(format!("Auth incomplete: {}", complete_tag));
+                    }
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to read from stream for AuthenticationOk: {}",
+                        e
+                    ));
+                }
+            }
+
+            return Ok(());
+        }
+    }
+}
+
 mod textpassword {
     use bytes::{Buf, BufMut, BytesMut};
     use std::io::{Read, Write};
@@ -329,7 +432,8 @@ mod textpassword {
                 password: encode_password(password),
             }
         }
-        pub fn authenticate(&self, stream: &mut TcpStream) -> Result<(), String> {
+
+        pub fn authenticate(&self, stream: &mut TcpStream, _read_buf: &[u8]) -> Result<(), String> {
             let mut buf = BytesMut::with_capacity(BUF_LEN);
             buf.put_u8(b'p'); // identify message as PasswordMessage
 
@@ -382,7 +486,6 @@ mod textpassword {
         }
     }
 }
-
 
 mod sasl {
     use base64::Engine;
@@ -582,7 +685,7 @@ mod sasl {
             Ok(())
         }
 
-        pub fn authenticate(&self, stream: &mut TcpStream) -> Result<(), String> {
+        pub fn authenticate(&self, stream: &mut TcpStream, _read_buf: &[u8]) -> Result<(), String> {
             let auth_type_text: &[u8] = b"SCRAM-SHA-256";
             match self.handle_sasl_authentication(stream, &auth_type_text) {
                 Ok(_) => {
