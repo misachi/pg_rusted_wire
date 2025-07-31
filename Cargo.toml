@@ -19,6 +19,6 @@ hex = "0.4"
 name = "pg_rusted_wire"
 path = "src/lib.rs"
 
-[[bin]]
-name = "pg_rusted_wire_exec"
-path = "src/main.rs"
+#[[bin]]
+#name = "pg_rusted_wire_exec"
+#path = "src/main.rs"

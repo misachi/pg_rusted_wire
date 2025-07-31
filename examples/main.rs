@@ -2,11 +2,12 @@ use bytes::BytesMut;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
-use pg_rusted_wire::*;
+use pg_rusted_wire::wire::*;
 
 const DEFAULT_USER: &str = "postgres";
 const DEFAULT_PORT: u16 = 5432;
-const DEFAULT_IP: &str = "localhost";
+const DEFAULT_IP: &str = "127.0.0.1";
+const DEFAULT_PASS: &str = "pass12234";
 
 fn main() {
     let mut startup_msg = StartupMsg::new(
@@ -16,11 +17,11 @@ fn main() {
         None,
     );
 
-    let client = Client::new(Ipv4Addr::from_str(DEFAULT_IP).unwrap(), DEFAULT_PORT);
+    let client = Client::new(Ipv4Addr::from_str(DEFAULT_IP).expect("IPV4 address error"), DEFAULT_PORT);
 
     match client.connect() {
         Ok(mut stream) => {
-            if let Err(e) = client.authenticate(&mut stream, &mut startup_msg, DEFAULT_USER) {
+            if let Err(e) = client.authenticate(&mut stream, &mut startup_msg, DEFAULT_PASS) {
                 eprintln!("Client Authentication: {}", e);
                 return;
             }
