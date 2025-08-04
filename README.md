@@ -1,6 +1,6 @@
 # PG_RUSTED_WIRE
 
-Postgres Wire Protocol implemented in Rust. Currently supports SASL `SCRAM-SHA-256` authentication only. Other authentication methods to be added soon
+Postgres Wire Protocol implemented in Rust. Currently supports `SCRAM-SHA-256`, `md5` and `password`  authentication.
 
 ## Example Usage
 
