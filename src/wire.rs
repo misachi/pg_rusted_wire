@@ -234,18 +234,20 @@ pub fn process_simple_query(
                         b'C' => {
                             // 'C' for CommandComplete
                             let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
-                            let cmd_tag: &[u8] = &buf[off + 5..off + msg_len as usize];
 
-                            println!(
-                                "Done with command tag: {:?}",
-                                String::from_utf8_lossy(cmd_tag)
-                            );
+                            // Check for Query ready
+                            if response[off + msg_len as usize + 1..][0] == b'Z' {
+                                break 'attempt_read;
+                            }
+                        }
+                        b'Z' => {
+                            // 'Z' for ReadyForQuery. TODO: Process different states
                             break 'attempt_read;
                         }
                         b'I' => {
                             // 'I' for EmptyQueryResponse
                             let msg_len: i32 = (&buf[1..5]).get_i32();
-                            println!("Empty Query Response with length: {}", msg_len);
+                            eprintln!("Empty Query Response with length: {}", msg_len);
                             break 'attempt_read;
                         }
                         b'E' => {
