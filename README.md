@@ -59,3 +59,27 @@ match client.connect() {  // Handle connection response(fail or success)
     }
 }
 ```
+
+Try running the [example](examples/main.rs) (make sure to create table `foo` and update the connection details in the file)
+
+Create table `foo`:
+```
+CREATE TABLE foo(id SERIAL PRIMARY KEY, k INT NOT NULL);
+INSERT INTO foo SELECT i, 1001+i FROM generate_series(1, 10) i;
+```
+
+Command to run example `cargo run --example main`
+Results
+```
+Authentication: MD5Password
+
+// Results for first Query
+Done with command tag: "SELECT 10"
+Row Description: "id|k"  // Columns
+Data Buffer: "1|1002 2|1003 3|1004 4|1005 5|1006 6|1007 7|1008 8|1009 9|1010 10|1011 "  // Row data
+
+// Results for second Query
+Done with command tag: "SELECT 4"
+Row Description: "id|k"    // Columns
+Data Buffer: "1|1002 2|1003 3|1004 4|1005 "  // Row Data
+```
