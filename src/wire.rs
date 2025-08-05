@@ -410,7 +410,7 @@ mod md5password {
 
             if let Err(e) = stream.write(&buf) {
                 return Err(format!(
-                    "Failed to write to stream for clear text password initial response: {}",
+                    "Failed to write to stream for clear md5 password initial response: {}",
                     e
                 ));
             }
