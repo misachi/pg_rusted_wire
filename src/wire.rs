@@ -81,8 +81,7 @@ impl Client {
                                 }
                                 AuthenticationType::MD5Password => {
                                     println!("Authentication: MD5Password");
-                                    let auth =
-                                        md5password::MD5Pass::new(&pass, &startup_msg.user);
+                                    let auth = md5password::MD5Pass::new(&pass, &startup_msg.user);
                                     auth.authenticate(stream, &buf)?;
                                     break;
                                 }
@@ -345,23 +344,23 @@ pub fn process_simple_query(
 
 mod md5password {
     use bytes::{Buf, BufMut, BytesMut};
+    use md5::{Digest, Md5};
     use std::io::{Read, Write};
     use std::net::TcpStream;
-    use md5::{Md5, Digest};
 
     use crate::wire::{BUF_LEN, add_buf_len, decoded_password, encode_password};
 
     #[derive(Debug)]
     pub struct MD5Pass {
         password: String,
-        user: String
+        user: String,
     }
 
     impl MD5Pass {
         pub fn new(password: &str, _user: &str) -> Self {
             MD5Pass {
                 password: encode_password(password),
-                user: _user.to_string()
+                user: _user.to_string(),
             }
         }
 
@@ -375,7 +374,11 @@ mod md5password {
 
             let mut ret_vec = vec![];
             let mut hasher = Md5::new();
-            ret_vec.put_slice(decoded_password(&self.password).expect("md5: Could not decode password").as_bytes());
+            ret_vec.put_slice(
+                decoded_password(&self.password)
+                    .expect("md5: Could not decode password")
+                    .as_bytes(),
+            );
             ret_vec.put_slice(self.user.as_bytes());
             hasher.update(&ret_vec);
 
