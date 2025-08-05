@@ -80,7 +80,6 @@ impl Client {
                                     break;
                                 }
                                 AuthenticationType::MD5Password => {
-                                    println!("Authentication: MD5Password");
                                     let auth = md5password::MD5Pass::new(&pass, &startup_msg.user);
                                     auth.authenticate(stream, &buf)?;
                                     break;
