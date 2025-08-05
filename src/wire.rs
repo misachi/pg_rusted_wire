@@ -150,9 +150,34 @@ fn add_buf_len(buf: &mut BytesMut, start_pos: usize, buf_len: i32) {
     buf[start_pos..start_pos + 4].copy_from_slice(&temp_buf);
 }
 
+fn format_row_desc(off: usize, num_cols: i16, resp_buf: &[u8], out_buf: &mut BytesMut) {
+    let mut off = off; // coerce offset to mutable type
+    let idx_fn = |buf: &[u8]| -> u32 {
+        let mut r = 0;
+        for c in buf {
+            if *c == b'\0' {
+                break;
+            }
+            r += 1;
+        }
+        r
+    };
+
+    for i in 0..num_cols {
+        let col_len = idx_fn(&resp_buf[off..]);
+        let row_data = &resp_buf[off..off + col_len as usize];
+        out_buf.put_slice(row_data);
+        if (i + 1) < num_cols {
+            out_buf.put_i8(b'|' as i8);
+        }
+        off += col_len as usize + 18 + 1;  // See https://www.postgresql.org/docs/17/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-ROWDESCRIPTION
+    }
+}
+
+
 /// Example function for how data rows will be formatted
 /// Each column will be separated by '|' and rows will be
-/// separated by newline '\n' character e.g `1|1\n`
+/// separated by single space ' ' character e.g `1|1 2|2`
 fn format_data_row(off: usize, num_cols: i16, resp_buf: &[u8], out_buf: &mut BytesMut) {
     let mut off = off; // coerce offset to mutable type
     for i in 0..num_cols {
@@ -165,7 +190,7 @@ fn format_data_row(off: usize, num_cols: i16, resp_buf: &[u8], out_buf: &mut Byt
         }
         off += col_len as usize;
     }
-    out_buf.put_u8(b'\n'); // Add newline for better readability
+    out_buf.put_u8(b' '); // Add newline for better readability
 }
 
 pub fn process_simple_query(
@@ -237,9 +262,13 @@ pub fn process_simple_query(
                         b'T' => {
                             // T for RowDescription
                             let msg_len: i32 = (&buf[1..5]).get_i32();
-                            let row_desc: &[u8] = &buf[7..msg_len as usize];
+                            // let row_desc: &[u8] = &buf[7..msg_len as usize];
 
-                            row_descr.put_slice(row_desc);
+                            // row_descr.put_slice(row_desc);
+                            let num_cols = (&buf[off + 5..off + 7]).get_i16();
+
+                            let val_off = off + 5 + 2; // Account for byte, 4 byte for content size, 2 bytes for column number
+                            format_row_desc(val_off, num_cols, &buf, row_descr);
 
                             size = if size > msg_len as usize {
                                 size - msg_len as usize - 1
