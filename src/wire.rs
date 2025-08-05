@@ -168,14 +168,13 @@ fn format_row_desc(off: usize, num_cols: i16, resp_buf: &[u8], out_buf: &mut Byt
         if (i + 1) < num_cols {
             out_buf.put_i8(b'|' as i8);
         }
-        off += col_len as usize + 18 + 1;  // See https://www.postgresql.org/docs/17/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-ROWDESCRIPTION
+        off += col_len as usize + 18 + 1; // See https://www.postgresql.org/docs/17/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-ROWDESCRIPTION
     }
 }
 
-
 /// Example function for how data rows will be formatted
 /// Each column will be separated by '|' and rows will be
-/// separated by single space ' ' character e.g `1|1 2|2`
+/// separated by newline '\n' character e.g `1|1\n2|2`
 fn format_data_row(off: usize, num_cols: i16, resp_buf: &[u8], out_buf: &mut BytesMut) {
     let mut off = off; // coerce offset to mutable type
     for i in 0..num_cols {
@@ -188,7 +187,7 @@ fn format_data_row(off: usize, num_cols: i16, resp_buf: &[u8], out_buf: &mut Byt
         }
         off += col_len as usize;
     }
-    out_buf.put_u8(b' '); // Add newline for better readability
+    out_buf.put_u8(b'\n'); // Add newline for better readability
 }
 
 pub fn process_simple_query(
