@@ -242,7 +242,14 @@ pub fn process_simple_query(
                         }
                         b'Z' => {
                             // 'Z' for ReadyForQuery. TODO: Process different states
-                            break 'attempt_read;
+                            let msg_len: i32 = (&buf[1..5]).get_i32();
+
+                            size = if size >= msg_len as usize {
+                                size - msg_len as usize
+                            } else {
+                                0
+                            };
+                            off += msg_len as usize + 1;
                         }
                         b'I' => {
                             // 'I' for EmptyQueryResponse
