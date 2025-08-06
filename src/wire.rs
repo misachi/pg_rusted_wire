@@ -2,7 +2,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::{Buf, BufMut, BytesMut};
 use std::fmt::Debug;
-use std::io::{Read, Write};
+use std::io::{Read, Write, stdout};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 
 const BUF_LEN: usize = 1024; // Buffer size for reading from the stream
@@ -253,9 +253,51 @@ pub fn process_simple_query(
                         b'E' => {
                             // 'E' for ErrorResponse
                             let msg_len: i32 = (&buf[1..5]).get_i32();
-                            let err_msg: &[u8] = &buf[6..msg_len as usize];
+                            let char_idx_fn = |buf: &[u8], key: u8| -> usize {
+                                let mut r = 0;
+                                for ch in buf {
+                                    if *ch == key {
+                                        break;
+                                    }
+                                    r += 1;
+                                }
+                                r as usize
+                            };
 
-                            eprintln!("Error message: {:?}", String::from_utf8_lossy(err_msg));
+                            // See https://www.postgresql.org/docs/17/protocol-error-fields.html#PROTOCOL-ERROR-FIELDS
+                            let out_msg = || -> BytesMut {
+                                let mut _off: usize = 0;
+                                let mut msg_out =  BytesMut::with_capacity(BUF_LEN);
+
+                                _off += 6;
+                                while _off < msg_len as usize {
+                                    let mut err_msg: &[u8];
+
+                                    if buf[_off] == b'V' {
+                                        _off += 1; // Skip error severity character
+                                        err_msg = &buf[_off..];
+                                        let end = char_idx_fn(err_msg, b'\0');
+                                        msg_out.put_slice(&err_msg[..end]);
+                                        _off += end; // Advance
+                                        msg_out.put_slice(": ".as_bytes());
+                                    }
+
+                                    if buf[_off] == b'M' {
+                                        _off += 1; // Skip error message character
+                                        err_msg = &buf[_off..];
+                                        let end = char_idx_fn(err_msg, b'\0');
+                                        msg_out.put_slice(&err_msg[..end]);
+                                        _off += end;  // Advance
+                                        break;
+                                    }
+                                    _off += 1;
+                                }
+                                msg_out
+                            }();
+
+                            if let Err(e) = stdout().write_all(&out_msg) {
+                                eprintln!("Simple Query Error: {}", e);
+                            }
                             break 'attempt_read;
                         }
                         b'T' => {
