@@ -1,4 +1,5 @@
 use bytes::{BufMut, BytesMut};
+use std::cmp::Ordering;
 use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
@@ -30,7 +31,7 @@ fn main() {
                 return;
             }
 
-            println!("Client connection\nUse Ctrl+c to end\n");
+            println!("Client connection\nUse Ctrl+c or type \"exit\" to end\n");
 
             let mut result_buf = BytesMut::new();
             let mut row_descr = BytesMut::new();
@@ -42,10 +43,16 @@ fn main() {
                 let mut msg = String::new();
 
                 io::stdin().read_line(&mut msg).expect("Error in read line");
+                msg = msg.trim().to_string();
 
                 if msg.len() <= 1 {
                     // Ignore empty. Account for newline char
                     continue;
+                }
+
+                match msg.cmp(&String::from("exit")) {
+                    Ordering::Equal => break,
+                    _ => (),
                 }
 
                 if let Err(e) =
