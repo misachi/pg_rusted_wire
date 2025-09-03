@@ -9,10 +9,12 @@ const DEFAULT_PORT: u16 = 5432;
 const DEFAULT_IP: &str = "127.0.0.1";
 const DEFAULT_PASS: &str = "pass12234";
 
+const DEFAULT_DATABASE: &str = "postgres";
+
 fn main() {
     let mut startup_msg = StartupMsg::new(
         String::from(DEFAULT_USER),
-        Some(String::from(DEFAULT_USER)),
+        Some(String::from(DEFAULT_DATABASE)),
         None,
         None,
     );
