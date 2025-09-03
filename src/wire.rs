@@ -190,17 +190,8 @@ fn format_data_row(off: usize, num_cols: i16, resp_buf: &[u8], out_buf: &mut Byt
     out_buf.put_u8(b'\n'); // Add newline for better readability
 }
 
-pub fn process_simple_query(
-    stream: &mut TcpStream,
-    msg: &str,
-    data_buf: &mut BytesMut,
-    row_descr: &mut BytesMut,
-) -> Result<(), String> {
+pub fn send_simple_query(stream: &mut TcpStream, msg: &str) -> Option<String> {
     let mut bytes = BytesMut::new();
-    let mut overflowed = false;
-    let mut skip_bytes = 0;
-    let mut overflow_buf = BytesMut::new();
-    let mut buf = [0; BUF_LEN]; // Buffer to read response
 
     bytes.put_u8(b'Q'); // Query message type
     let start_pos = bytes.len();
@@ -212,8 +203,21 @@ pub fn process_simple_query(
     add_buf_len(&mut bytes, start_pos, buf_len);
 
     if let Err(e) = stream.write(&bytes) {
-        return Err(format!("Failed to write query to stream: {}", e));
+        return Some(format!("Failed to write query to stream: {}", e));
     }
+    None
+}
+
+pub fn process_simple_query(
+    stream: &mut TcpStream,
+    data_buf: &mut BytesMut,
+    row_descr: &mut BytesMut,
+) -> Result<bool, String> {
+    let mut overflowed = false;
+    let mut skip_bytes = 0;
+    let mut overflow_buf = BytesMut::new();
+    let mut buf = [0; BUF_LEN]; // Buffer to read response
+    let mut is_done = false;
 
     'attempt_read: loop {
         match stream.read(&mut buf) {
@@ -237,6 +241,7 @@ pub fn process_simple_query(
 
                             // Check for Query ready
                             if response[off + msg_len as usize + 1..][0] == b'Z' {
+                                is_done = true;
                                 break 'attempt_read;
                             }
                         }
@@ -255,6 +260,7 @@ pub fn process_simple_query(
                             // 'I' for EmptyQueryResponse
                             let msg_len: i32 = (&buf[1..5]).get_i32();
                             eprintln!("Empty Query Response with length: {}", msg_len);
+                            is_done = true;
                             break 'attempt_read;
                         }
                         b'E' => {
@@ -274,7 +280,7 @@ pub fn process_simple_query(
                             // See https://www.postgresql.org/docs/17/protocol-error-fields.html#PROTOCOL-ERROR-FIELDS
                             let out_msg = || -> BytesMut {
                                 let mut _off: usize = 0;
-                                let mut msg_out =  BytesMut::with_capacity(BUF_LEN);
+                                let mut msg_out = BytesMut::with_capacity(BUF_LEN);
 
                                 _off += 6;
                                 while _off < msg_len as usize {
@@ -294,7 +300,7 @@ pub fn process_simple_query(
                                         err_msg = &buf[_off..];
                                         let end = char_idx_fn(err_msg, b'\0');
                                         msg_out.put_slice(&err_msg[..end]);
-                                        _off += end;  // Advance
+                                        _off += end; // Advance
                                         break;
                                     }
                                     _off += 1;
@@ -305,6 +311,7 @@ pub fn process_simple_query(
                             if let Err(e) = stdout().write_all(&out_msg) {
                                 eprintln!("Simple Query Error: {}", e);
                             }
+                            is_done = true;
                             break 'attempt_read;
                         }
                         b'T' => {
@@ -327,14 +334,24 @@ pub fn process_simple_query(
                         }
                         b'D' => {
                             // 'D' for DataRow
+
+                            // Check if we have enough data to read message length. If not,
+                            // put in overflow buffer to be handled later
+                            if off + 5 > cpy_size {
+                                overflowed = true;
+                                overflow_buf.put_slice(&buf[off..cpy_size]);
+                                skip_bytes = buf[off..cpy_size].len() as i32;
+                                buf.fill(0); // We'll need to reuse buffer
+                                break;
+                            }
                             let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
 
                             // Check if the message length exceeds the available data
                             // If so, put in overflow buffer to be handled later
                             if off + msg_len as usize + 1 > cpy_size {
                                 overflowed = true;
-                                overflow_buf.put_slice(&buf[off..]);
-                                skip_bytes = (msg_len + 1) - buf[off..].len() as i32;
+                                overflow_buf.put_slice(&buf[off..cpy_size]);
+                                skip_bytes = buf[off..cpy_size].len() as i32;
                                 buf.fill(0); // We'll need to reuse buffer
                                 break;
                             }
@@ -353,7 +370,9 @@ pub fn process_simple_query(
                         _ => {
                             // Handle incomplete data in read buffer
                             if overflowed {
-                                overflow_buf.put_slice(&buf[..skip_bytes as usize]);
+                                overflow_buf.put_slice(&buf[..cpy_size]);
+                                let msg_len: i32 = (&overflow_buf[1..5]).get_i32();
+                                skip_bytes = (msg_len + 1) - skip_bytes;
 
                                 size -= skip_bytes as usize;
                                 off += skip_bytes as usize;
@@ -388,7 +407,7 @@ pub fn process_simple_query(
         }
     }
 
-    Ok(())
+    Ok(is_done)
 }
 
 mod md5password {

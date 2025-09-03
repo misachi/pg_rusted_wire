@@ -58,24 +58,50 @@ fn main() {
                     _ => (),
                 }
 
-                if let Err(e) =
-                    process_simple_query(&mut stream, &msg, &mut result_buf, &mut row_descr)
-                {
-                    eprintln!("Error processing simple query: {}", e);
-                    return;
+                match send_simple_query(&mut stream, &msg) {
+                    Some(e) => {
+                        eprintln!("Query Error: {}", e);
+                        return;
+                    }
+                    _ => (),
                 }
 
-                result_buf.put_u8(b'\n');
-                row_descr.put_u8(b'\n');
-                if let Err(e) = io::stdout().write_all(&row_descr) {
-                    eprintln!("Error when writing to stdout for RowDescription: {}", e);
-                }
-                if let Err(e) = io::stdout().write_all(&result_buf) {
-                    eprintln!("Error when writing to stdout for DataRow: {}", e);
-                }
+                loop {
+                    match process_simple_query(&mut stream, &mut result_buf, &mut row_descr) {
+                        Ok(done) => {
+                            if done {
+                                result_buf.put_u8(b'\n');
+                                row_descr.put_u8(b'\n');
+                                if let Err(e) = io::stdout().write_all(&row_descr) {
+                                    eprintln!(
+                                        "Error when writing to stdout for RowDescription: {}",
+                                        e
+                                    );
+                                }
+                                if let Err(e) = io::stdout().write_all(&result_buf) {
+                                    eprintln!("Error when writing to stdout for DataRow: {}", e);
+                                }
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error processing simple query: {}", e);
+                            return;
+                        }
+                    }
 
-                result_buf.clear();
-                row_descr.clear();
+                    result_buf.put_u8(b'\n');
+                    row_descr.put_u8(b'\n');
+                    if let Err(e) = io::stdout().write_all(&row_descr) {
+                        eprintln!("Error when writing to stdout for RowDescription: {}", e);
+                    }
+                    if let Err(e) = io::stdout().write_all(&result_buf) {
+                        eprintln!("Error when writing to stdout for DataRow: {}", e);
+                    }
+
+                    result_buf.clear();
+                    row_descr.clear();
+                }
             }
         }
         Err(e) => {

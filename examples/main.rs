@@ -29,11 +29,19 @@ fn main() {
             }
 
             // Okay to use stream to send queries at this point
-            let mut msg = "SELECT * FROM foo;"; // First Query
+            let mut msg = "SELECT * FROM foo LIMIT 100;"; // First Query
             let result_buf = &mut BytesMut::new();
             let row_descr = &mut BytesMut::new();
 
-            if let Err(e) = process_simple_query(&mut stream, msg, result_buf, row_descr) {
+            match send_simple_query(&mut stream, &msg) {
+                Some(e) => {
+                    eprintln!("Query Error: {}", e);
+                    return;
+                }
+                _ => (),
+            }
+
+            if let Err(e) = process_simple_query(&mut stream, result_buf, row_descr) {
                 eprintln!("Error processing simple query: {}", e);
                 return;
             }
@@ -46,11 +54,20 @@ fn main() {
             result_buf.clear();
             row_descr.clear();
 
-            msg = "SELECT * FROM foo WHERE id < 5;"; // Second Query
-            if let Err(e) = process_simple_query(&mut stream, msg, result_buf, row_descr) {
+            msg = "SELECT * FROM foo WHERE id < 5 LIMIT 100;"; // Second Query
+
+            match send_simple_query(&mut stream, &msg) {
+                Some(e) => {
+                    eprintln!("Query Error: {}", e);
+                    return;
+                }
+                _ => (),
+            }
+            if let Err(e) = process_simple_query(&mut stream, result_buf, row_descr) {
                 eprintln!("Error processing simple query: {}", e);
                 return;
             }
+
             println!("Row Description: {:?}", String::from_utf8_lossy(row_descr));
             println!("Data Buffer: {:?}", String::from_utf8_lossy(result_buf));
         }
