@@ -20,6 +20,12 @@ fn main() {
     );
 
     let client = Client::new(Ipv4Addr::from_str(DEFAULT_IP).expect("IPV4 address error"), DEFAULT_PORT);
+    let mut state = QueryState {
+        overflowed: false,
+        skip_bytes: 0,
+        overflow_buf: BytesMut::new(),
+        data_buf_off: 0,
+    };
 
     match client.connect() {
         Ok(mut stream) => {
@@ -30,8 +36,8 @@ fn main() {
 
             // Okay to use stream to send queries at this point
             let mut msg = "SELECT * FROM foo LIMIT 100;"; // First Query
-            let result_buf = &mut BytesMut::new();
-            let row_descr = &mut BytesMut::new();
+            let mut result_buf = [0;4096];
+            let mut row_descr = BytesMut::new();
 
             match send_simple_query(&mut stream, &msg) {
                 Some(e) => {
@@ -41,18 +47,14 @@ fn main() {
                 _ => (),
             }
 
-            if let Err(e) = process_simple_query(&mut stream, result_buf, row_descr) {
+            if let Err(e) = process_simple_query(&mut stream, &mut result_buf, &mut row_descr, &mut state) {
                 eprintln!("Error processing simple query: {}", e);
                 return;
             }
 
             // Just print results here
-            println!("Row Description: {:?}", String::from_utf8_lossy(row_descr));
-            println!("Data Buffer: {:?}", String::from_utf8_lossy(result_buf));
-
-            // Reset buffers for reuse before sending second query
-            result_buf.clear();
-            row_descr.clear();
+            println!("Row Description: {:?}", String::from_utf8_lossy(&row_descr));
+            println!("Data Buffer: {:?}", String::from_utf8_lossy(&result_buf[..state.data_buf_off]));
 
             msg = "SELECT * FROM foo WHERE id < 5 LIMIT 100;"; // Second Query
 
@@ -63,13 +65,13 @@ fn main() {
                 }
                 _ => (),
             }
-            if let Err(e) = process_simple_query(&mut stream, result_buf, row_descr) {
+            if let Err(e) = process_simple_query(&mut stream, &mut result_buf, &mut row_descr, &mut state) {
                 eprintln!("Error processing simple query: {}", e);
                 return;
             }
 
-            println!("Row Description: {:?}", String::from_utf8_lossy(row_descr));
-            println!("Data Buffer: {:?}", String::from_utf8_lossy(result_buf));
+            println!("Row Description: {:?}", String::from_utf8_lossy(&row_descr));
+            println!("Data Buffer: {:?}", String::from_utf8_lossy(&result_buf[..state.data_buf_off]));
         }
         Err(e) => {
             eprintln!("No stream available for client: {}", e);
