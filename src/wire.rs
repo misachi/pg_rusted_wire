@@ -943,8 +943,167 @@ impl StartupMsg {
 
 #[cfg(test)]
 mod tests {
+    use std::{net::TcpListener, thread};
+
     use super::*;
 
     #[test]
-    fn foobar() {}
+    fn test_encode_decode_password() {
+        let password = "secret123";
+        let encoded = encode_password(password);
+        let decoded = decoded_password(&encoded).unwrap();
+        assert_eq!(decoded, password);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unknown authentication type")]
+    fn test_get_auth_type_unknown() {
+        get_auth_type(999);
+    }
+
+    #[test]
+    fn test_get_auth_type_variants() {
+        assert!(matches!(
+            get_auth_type(3),
+            AuthenticationType::CleartextPassword
+        ));
+        assert!(matches!(get_auth_type(5), AuthenticationType::MD5Password));
+        assert!(matches!(get_auth_type(10), AuthenticationType::SASL));
+    }
+
+    #[test]
+    fn test_put_cstring() {
+        let mut buf = BytesMut::new();
+        put_cstring(&mut buf, "hello");
+        assert_eq!(&buf[..], b"hello\0");
+    }
+
+    #[test]
+    fn test_add_buf_len() {
+        let mut buf = BytesMut::with_capacity(8);
+        buf.put_i32(0);
+        buf.put_i32(1234);
+        add_buf_len(&mut buf, 0, 8);
+        assert_eq!((&buf[0..4]).get_i32(), 8);
+    }
+
+    #[test]
+    fn test_startup_msg_to_bytes() {
+        let mut msg = StartupMsg::new(
+            "user1".to_string(),
+            Some("db1".to_string()),
+            Some("opt1".to_string()),
+            Some(true),
+        );
+        let bytes = msg.to_bytes();
+        // Should start with length and protocol version
+        assert_eq!(bytes[4..8], PROTOCOL_VERSION.to_be_bytes());
+        assert!(bytes.windows(5).any(|w| w == b"user\0"));
+        assert!(bytes.windows(6).any(|w| *w == b"db1\0\0"[..6]));
+    }
+
+    #[test]
+    fn test_client_new() {
+        let client = Client::new(Ipv4Addr::LOCALHOST, 5432);
+        assert_eq!(client.addr, Ipv4Addr::LOCALHOST);
+        assert_eq!(client.port, 5432);
+    }
+
+    #[test]
+    fn test_send_simple_query_error() {
+        // Use a dummy stream that will fail
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 128];
+            socket.read(&mut buf).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.shutdown(std::net::Shutdown::Both).unwrap(); // force error
+        let err = send_simple_query(&mut stream, "SELECT 1");
+        assert!(err.is_some());
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_format_row_desc_and_data_row() {
+        let mut row_descr = BytesMut::new();
+        // Simulate a RowDescription message with two columns, names "id" and "name"
+        let resp_buf = b"id\0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+                       name\0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        format_row_desc(0, 2, resp_buf, &mut row_descr);
+        assert!(row_descr.windows(1).any(|w| w == b"|"));
+
+        let mut data_buf = [0u8; 128];
+        // Simulate DataRow: 2 columns, "1" and "Alice"
+        let mut resp_buf = vec![];
+        resp_buf.extend(&(1i32.to_be_bytes())); // col1 len
+        resp_buf.extend(b"1");
+        resp_buf.extend(&(5i32.to_be_bytes())); // col2 len
+        resp_buf.extend(b"Alice");
+        let state = &mut QueryState {
+            overflowed: false,
+            overflow_buf: BytesMut::new(),
+            skip_bytes: 0,
+            data_buf_off: 0,
+        };
+        format_data_row(0, 2, &resp_buf, &mut data_buf, state);
+        let row = std::str::from_utf8(&data_buf[..state.data_buf_off]).unwrap();
+        assert!(row.contains("1|Alice\n"));
+    }
+
+    #[test]
+    fn test_get_auth_type() {
+        assert!(matches!(get_auth_type(5), AuthenticationType::MD5Password));
+        assert!(matches!(get_auth_type(10), AuthenticationType::SASL));
+        assert!(matches!(
+            get_auth_type(3),
+            AuthenticationType::CleartextPassword
+        ));
+    }
+
+    #[test]
+    fn test_startup_msg_to_bytes_contains_user() {
+        let mut msg = StartupMsg::new(
+            "testuser".to_string(),
+            Some("testdb".to_string()),
+            None,
+            None,
+        );
+        let bytes = msg.to_bytes();
+        let as_str = String::from_utf8_lossy(&bytes);
+        assert!(as_str.contains("testuser"));
+        assert!(as_str.contains("testdb"));
+    }
+
+    #[test]
+    fn test_format_row_desc() {
+        let mut out_buf = BytesMut::new();
+        // Simulate a row description with two columns: "id\0" and "name\0"
+        let resp_buf =
+            b"id\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0name\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        format_row_desc(0, 2, resp_buf, &mut out_buf);
+        let as_str = String::from_utf8_lossy(&out_buf);
+        assert!(as_str.contains("id|name"));
+    }
+
+    #[test]
+    fn test_format_data_row_simple() {
+        let mut state = QueryState {
+            overflowed: false,
+            skip_bytes: 0,
+            overflow_buf: BytesMut::new(),
+            data_buf_off: 0,
+        };
+        // Simulate a data row with 1 column of length 3 ("abc")
+        let mut resp_buf = vec![];
+        resp_buf.extend_from_slice(&3i32.to_be_bytes()); // column length
+        resp_buf.extend_from_slice(b"abc"); // column data
+        let mut out_buf = [0u8; 16];
+        format_data_row(0, 1, &resp_buf, &mut out_buf, &mut state);
+        let result = std::str::from_utf8(&out_buf[..state.data_buf_off]).unwrap();
+        assert_eq!(result, "abc\n");
+    }
 }
