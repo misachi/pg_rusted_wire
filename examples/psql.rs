@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
+use std::time::Duration;
 
 use pg_rusted_wire::wire::*;
 
@@ -26,6 +27,12 @@ fn main() {
         Ipv4Addr::from_str(DEFAULT_IP).expect("IPV4 address error"),
         DEFAULT_PORT,
     );
+    let mut state = QueryState {
+        overflowed: false,
+        skip_bytes: 0,
+        overflow_buf: BytesMut::new(),
+        data_buf_off: 0,
+    };
 
     match client.connect() {
         Ok(mut stream) => {
@@ -36,7 +43,7 @@ fn main() {
 
             println!("Client connection\nUse Ctrl+c or type \"exit\" to end\n");
 
-            let mut result_buf = BytesMut::new();
+            let mut result_buf = [0;4096];
             let mut row_descr = BytesMut::new();
 
             loop {
@@ -67,10 +74,11 @@ fn main() {
                 }
 
                 loop {
-                    match process_simple_query(&mut stream, &mut result_buf, &mut row_descr) {
+                    stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap(); // Set a timeout to avoid blocking indefinitely
+                    state.data_buf_off = 0;
+                    match process_simple_query(&mut stream, &mut result_buf, &mut row_descr, &mut state) {
                         Ok(done) => {
                             if done {
-                                result_buf.put_u8(b'\n');
                                 row_descr.put_u8(b'\n');
                                 if let Err(e) = io::stdout().write_all(&row_descr) {
                                     eprintln!(
@@ -90,17 +98,14 @@ fn main() {
                         }
                     }
 
-                    result_buf.put_u8(b'\n');
                     row_descr.put_u8(b'\n');
                     if let Err(e) = io::stdout().write_all(&row_descr) {
                         eprintln!("Error when writing to stdout for RowDescription: {}", e);
                     }
-                    if let Err(e) = io::stdout().write_all(&result_buf) {
+                    if let Err(e) = io::stdout().write_all(&result_buf[..state.data_buf_off]) {
                         eprintln!("Error when writing to stdout for DataRow: {}", e);
                     }
 
-                    result_buf.clear();
-                    row_descr.clear();
                 }
             }
         }
