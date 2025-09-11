@@ -8,6 +8,13 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 const BUF_LEN: usize = 1024; // Buffer size for reading from the stream
 const PROTOCOL_VERSION: i32 = 196608; // 3.0.0 in PostgreSQL protocol versioning
 
+pub struct QueryState {
+    pub overflowed: bool,
+    pub skip_bytes: u32,
+    pub overflow_buf: BytesMut,
+    pub data_buf_off: usize,
+}
+
 #[derive(Debug)]
 pub struct StartupMsg {
     protocol: i32,
@@ -175,19 +182,45 @@ fn format_row_desc(off: usize, num_cols: i16, resp_buf: &[u8], out_buf: &mut Byt
 /// Example function for how data rows will be formatted
 /// Each column will be separated by '|' and rows will be
 /// separated by newline '\n' character e.g `1|1\n2|2`
-fn format_data_row(off: usize, num_cols: i16, resp_buf: &[u8], out_buf: &mut BytesMut) {
+fn format_data_row(
+    off: usize,
+    num_cols: i16,
+    resp_buf: &[u8],
+    out_buf: &mut [u8],
+    state: &mut QueryState,
+) {
     let mut off = off; // coerce offset to mutable type
+    // println!("Row: {:?}", String::from_utf8_lossy(&resp_buf[off..]));
+    let row_start = off - 7; // Start of DataRow message
+    let buf_off = state.data_buf_off; // Save current offset into output buffer
     for i in 0..num_cols {
         let col_len = (&resp_buf[off..off + 4]).get_i32();
         off += 4;
         let row_data = &resp_buf[off..off + col_len as usize];
-        out_buf.put_slice(row_data);
+        if state.data_buf_off + col_len as usize >= out_buf.len() {
+            // Prevent overflow
+            state.overflow_buf.clear();
+            state
+                .overflow_buf
+                .put_slice(&resp_buf[row_start as usize..]);
+            state.skip_bytes = resp_buf[row_start as usize..].len() as u32;
+            state.data_buf_off = buf_off; // Reset offset
+            off = row_start;
+            _ = off;
+            return;
+        }
+        out_buf[state.data_buf_off..state.data_buf_off + col_len as usize]
+            .copy_from_slice(row_data);
+        state.data_buf_off += col_len as usize;
+
         if (i + 1) < num_cols {
-            out_buf.put_i8(b'|' as i8);
+            out_buf[state.data_buf_off] = b'|';
+            state.data_buf_off += 1;
         }
         off += col_len as usize;
     }
-    out_buf.put_u8(b'\n'); // Add newline for better readability
+    out_buf[state.data_buf_off] = b'\n'; // Add newline for better readability
+    state.data_buf_off += 1;
 }
 
 pub fn send_simple_query(stream: &mut TcpStream, msg: &str) -> Option<String> {
@@ -210,199 +243,217 @@ pub fn send_simple_query(stream: &mut TcpStream, msg: &str) -> Option<String> {
 
 pub fn process_simple_query(
     stream: &mut TcpStream,
-    data_buf: &mut BytesMut,
+    data_buf: &mut [u8],
     row_descr: &mut BytesMut,
+    state: &mut QueryState,
 ) -> Result<bool, String> {
-    let mut overflowed = false;
-    let mut skip_bytes = 0;
-    let mut overflow_buf = BytesMut::new();
     let mut buf = [0; BUF_LEN]; // Buffer to read response
+    let mut buf_off = 0;
     let mut is_done = false;
 
+    if state.skip_bytes > 0 {
+        buf[..state.skip_bytes as usize]
+            .copy_from_slice(&state.overflow_buf[..state.skip_bytes as usize]);
+        buf_off += state.skip_bytes as usize;
+        state.skip_bytes = 0;
+    }
+
     'attempt_read: loop {
-        match stream.read(&mut buf) {
-            Ok(mut size) => {
-                if size <= 0 {
+        let mut size: usize;
+        match stream.read(&mut buf[buf_off..]) {
+            Ok(r_size) => {
+                if r_size <= 0 {
                     return Err("Server closed the connection".to_string());
                 }
 
-                if size > BUF_LEN {
+                if r_size > BUF_LEN {
                     return Err("Received data exceeds buffer size".to_string());
                 }
-
-                let response = &buf[..size];
-                let mut off = 0;
-                let cpy_size = size;
-                while size > 0 && off < cpy_size {
-                    match response[off..][0] {
-                        b'C' => {
-                            // 'C' for CommandComplete
-                            let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
-
-                            // Check for Query ready
-                            if response[off + msg_len as usize + 1..][0] == b'Z' {
-                                is_done = true;
-                                break 'attempt_read;
-                            }
-                        }
-                        b'Z' => {
-                            // 'Z' for ReadyForQuery. TODO: Process different states
-                            let msg_len: i32 = (&buf[1..5]).get_i32();
-
-                            size = if size >= msg_len as usize {
-                                size - msg_len as usize
-                            } else {
-                                0
-                            };
-                            off += msg_len as usize + 1;
-                        }
-                        b'I' => {
-                            // 'I' for EmptyQueryResponse
-                            let msg_len: i32 = (&buf[1..5]).get_i32();
-                            eprintln!("Empty Query Response with length: {}", msg_len);
-                            is_done = true;
-                            break 'attempt_read;
-                        }
-                        b'E' => {
-                            // 'E' for ErrorResponse
-                            let msg_len: i32 = (&buf[1..5]).get_i32();
-                            let char_idx_fn = |buf: &[u8], key: u8| -> usize {
-                                let mut r = 0;
-                                for ch in buf {
-                                    if *ch == key {
-                                        break;
-                                    }
-                                    r += 1;
-                                }
-                                r as usize
-                            };
-
-                            // See https://www.postgresql.org/docs/17/protocol-error-fields.html#PROTOCOL-ERROR-FIELDS
-                            let out_msg = || -> BytesMut {
-                                let mut _off: usize = 0;
-                                let mut msg_out = BytesMut::with_capacity(BUF_LEN);
-
-                                _off += 6;
-                                while _off < msg_len as usize {
-                                    let mut err_msg: &[u8];
-
-                                    if buf[_off] == b'V' {
-                                        _off += 1; // Skip error severity character
-                                        err_msg = &buf[_off..];
-                                        let end = char_idx_fn(err_msg, b'\0');
-                                        msg_out.put_slice(&err_msg[..end]);
-                                        _off += end; // Advance
-                                        msg_out.put_slice(": ".as_bytes());
-                                    }
-
-                                    if buf[_off] == b'M' {
-                                        _off += 1; // Skip error message character
-                                        err_msg = &buf[_off..];
-                                        let end = char_idx_fn(err_msg, b'\0');
-                                        msg_out.put_slice(&err_msg[..end]);
-                                        _off += end; // Advance
-                                        break;
-                                    }
-                                    _off += 1;
-                                }
-                                msg_out
-                            }();
-
-                            if let Err(e) = stdout().write_all(&out_msg) {
-                                eprintln!("Simple Query Error: {}", e);
-                            }
-                            is_done = true;
-                            break 'attempt_read;
-                        }
-                        b'T' => {
-                            // T for RowDescription
-                            let msg_len: i32 = (&buf[1..5]).get_i32();
-                            // let row_desc: &[u8] = &buf[7..msg_len as usize];
-
-                            // row_descr.put_slice(row_desc);
-                            let num_cols = (&buf[off + 5..off + 7]).get_i16();
-
-                            let val_off = off + 5 + 2; // Account for byte, 4 byte for content size, 2 bytes for column number
-                            format_row_desc(val_off, num_cols, &buf, row_descr);
-
-                            size = if size > msg_len as usize {
-                                size - msg_len as usize - 1
-                            } else {
-                                0
-                            };
-                            off += msg_len as usize + 1;
-                        }
-                        b'D' => {
-                            // 'D' for DataRow
-
-                            // Check if we have enough data to read message length. If not,
-                            // put in overflow buffer to be handled later
-                            if off + 5 > cpy_size {
-                                overflowed = true;
-                                overflow_buf.put_slice(&buf[off..cpy_size]);
-                                skip_bytes = buf[off..cpy_size].len() as i32;
-                                buf.fill(0); // We'll need to reuse buffer
-                                break;
-                            }
-                            let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
-
-                            // Check if the message length exceeds the available data
-                            // If so, put in overflow buffer to be handled later
-                            if off + msg_len as usize + 1 > cpy_size {
-                                overflowed = true;
-                                overflow_buf.put_slice(&buf[off..cpy_size]);
-                                skip_bytes = buf[off..cpy_size].len() as i32;
-                                buf.fill(0); // We'll need to reuse buffer
-                                break;
-                            }
-                            let num_cols = (&buf[off + 5..off + 7]).get_i16();
-
-                            let val_off = off + 5 + 2; // Account for byte, 4 byte for content size, 2 bytes for column number
-                            format_data_row(val_off, num_cols, &buf, data_buf);
-
-                            size = if size > msg_len as usize {
-                                size - msg_len as usize - 1
-                            } else {
-                                0
-                            };
-                            off += msg_len as usize + 1;
-                        }
-                        _ => {
-                            // Handle incomplete data in read buffer
-                            if overflowed {
-                                overflow_buf.put_slice(&buf[..cpy_size]);
-                                let msg_len: i32 = (&overflow_buf[1..5]).get_i32();
-                                skip_bytes = (msg_len + 1) - skip_bytes;
-
-                                size -= skip_bytes as usize;
-                                off += skip_bytes as usize;
-
-                                let num_cols = (&overflow_buf[5..7]).get_i16();
-
-                                let val_off = 5 + 2; // Account for byte, 4 byte for content size, 2 bytes for column number
-                                format_data_row(val_off, num_cols, &overflow_buf, data_buf);
-
-                                overflow_buf.clear();
-                                overflowed = false;
-                                skip_bytes = 0;
-                            } else {
-                                let msg_len: i32 = (&buf[1..5]).get_i32();
-                                eprintln!(
-                                    "Unexpected message type when processing simple query: {:?}",
-                                    String::from_utf8_lossy(&buf[0].to_le_bytes())
-                                );
-                                size = if size >= msg_len as usize {
-                                    size - msg_len as usize
-                                } else {
-                                    0
-                                };
-                            }
-                        }
-                    }
-                }
+                size = r_size + buf_off;
+                buf_off = 0;
             }
             Err(e) => {
                 return Err(format!("Failed to read from stream: {}", e));
+            }
+        }
+
+        let response = &buf[..size];
+        let mut off = 0;
+        let cpy_size = size;
+        while size > 0 && off < cpy_size {
+            match response[off..][0] {
+                b'C' => {
+                    // 'C' for CommandComplete
+                    // let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
+
+                    // // Check for Query ready
+                    // if (off + msg_len as usize + 1) < response.len() && response[off + msg_len as usize + 1..][0] == b'Z' {
+                    //     is_done = true;
+                    //     // break 'attempt_read;
+                    // }
+                    is_done = true;
+                    break 'attempt_read;
+                }
+                b'Z' => {
+                    // 'Z' for ReadyForQuery. TODO: Process different states
+                    let msg_len: i32 = (&buf[1..5]).get_i32();
+
+                    size = if size >= msg_len as usize {
+                        size - msg_len as usize
+                    } else {
+                        0
+                    };
+                    off += msg_len as usize + 1;
+                }
+                b'I' => {
+                    // 'I' for EmptyQueryResponse
+                    let msg_len: i32 = (&buf[1..5]).get_i32();
+                    eprintln!("Empty Query Response with length: {}", msg_len);
+                    is_done = true;
+                    break 'attempt_read;
+                }
+                b'E' => {
+                    // 'E' for ErrorResponse
+                    let msg_len: i32 = (&buf[1..5]).get_i32();
+                    let char_idx_fn = |buf: &[u8], key: u8| -> usize {
+                        let mut r = 0;
+                        for ch in buf {
+                            if *ch == key {
+                                break;
+                            }
+                            r += 1;
+                        }
+                        r as usize
+                    };
+
+                    // See https://www.postgresql.org/docs/17/protocol-error-fields.html#PROTOCOL-ERROR-FIELDS
+                    let out_msg = || -> BytesMut {
+                        let mut _off: usize = 0;
+                        let mut msg_out = BytesMut::with_capacity(BUF_LEN);
+
+                        _off += 6;
+                        while _off < msg_len as usize {
+                            let mut err_msg: &[u8];
+
+                            if buf[_off] == b'V' {
+                                _off += 1; // Skip error severity character
+                                err_msg = &buf[_off..];
+                                let end = char_idx_fn(err_msg, b'\0');
+                                msg_out.put_slice(&err_msg[..end]);
+                                _off += end; // Advance
+                                msg_out.put_slice(": ".as_bytes());
+                            }
+
+                            if buf[_off] == b'M' {
+                                _off += 1; // Skip error message character
+                                err_msg = &buf[_off..];
+                                let end = char_idx_fn(err_msg, b'\0');
+                                msg_out.put_slice(&err_msg[..end]);
+                                _off += end; // Advance
+                                break;
+                            }
+                            _off += 1;
+                        }
+                        msg_out
+                    }();
+
+                    if let Err(e) = stdout().write_all(&out_msg) {
+                        eprintln!("Simple Query Error: {}", e);
+                    }
+                    is_done = true;
+                    break 'attempt_read;
+                }
+                b'T' => {
+                    // T for RowDescription
+                    let msg_len: i32 = (&buf[1..5]).get_i32();
+                    let num_cols = (&buf[off + 5..off + 7]).get_i16();
+
+                    let val_off = off + 5 + 2; // Account for byte, 4 byte for content size, 2 bytes for column number
+                    format_row_desc(val_off, num_cols, &buf, row_descr);
+
+                    size = if size > msg_len as usize {
+                        size - msg_len as usize - 1
+                    } else {
+                        0
+                    };
+                    off += msg_len as usize + 1;
+                }
+                b'D' => {
+                    // 'D' for DataRow
+
+                    // Check if we have enough data to read full message length. If not,
+                    // put in overflow buffer to be handled later
+                    if off + 5 > cpy_size {
+                        state.overflowed = true;
+                        state.overflow_buf.clear();
+                        state.overflow_buf.put_slice(&buf[off..cpy_size]);
+                        state.skip_bytes = buf[off..cpy_size].len() as u32;
+                        break;
+                    }
+                    let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
+
+                    // Check if the message length exceeds the available data
+                    // If so, put in overflow buffer to be handled later
+                    if off + msg_len as usize + 1 > cpy_size {
+                        state.overflowed = true;
+                        state.overflow_buf.clear();
+                        state.overflow_buf.put_slice(&buf[off..cpy_size]);
+                        state.skip_bytes = buf[off..cpy_size].len() as u32;
+                        break;
+                    }
+                    let num_cols = (&buf[off + 5..off + 7]).get_i16();
+
+                    let val_off = off + 5 + 2; // Account for byte, 4 byte for content size, 2 bytes for column number
+                    format_data_row(val_off, num_cols, &buf, data_buf, state);
+                    if state.skip_bytes > 0 {
+                        return Ok(is_done);
+                    }
+
+                    size = if size > msg_len as usize {
+                        size - msg_len as usize - 1
+                    } else {
+                        0
+                    };
+                    off += msg_len as usize + 1;
+                    if off >= cpy_size {
+                        return Ok(is_done);
+                    }
+                }
+                _ => {
+                    // Handle incomplete data in read buffer(Alot to improve here)
+                    if state.overflowed && state.skip_bytes > 0 {
+                        state.overflow_buf.put_slice(&buf[..cpy_size]); // What??
+                        let msg_len: i32 = (&state.overflow_buf[1..5]).get_i32();
+                        state.skip_bytes = (msg_len + 1) as u32 - state.skip_bytes;
+
+                        size -= state.skip_bytes as usize;
+                        off += state.skip_bytes as usize;
+
+                        let num_cols = (&state.overflow_buf[5..7]).get_i16();
+
+                        let val_off = 5 + 2; // Account for byte, 4 byte for content size, 2 bytes for column number
+
+                        //TODO: CLean this up. Not looking good
+                        let mut buf = BytesMut::with_capacity(state.overflow_buf.len());
+                        buf.put_slice(&state.overflow_buf);
+                        format_data_row(val_off, num_cols, &buf, data_buf, state);
+
+                        state.overflow_buf.clear();
+                        state.overflowed = false;
+                        state.skip_bytes = 0;
+                    } else {
+                        let msg_len: i32 = (&buf[1..5]).get_i32();
+                        eprintln!(
+                            "Unexpected message type when processing simple query: {:?}",
+                            String::from_utf8_lossy(&buf[0].to_le_bytes())
+                        );
+                        size = if size >= msg_len as usize {
+                            size - msg_len as usize
+                        } else {
+                            0
+                        };
+                    }
+                }
             }
         }
     }
