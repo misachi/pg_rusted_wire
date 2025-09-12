@@ -4,6 +4,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use std::fmt::Debug;
 use std::io::{Read, Write, stdout};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use chrono::{Utc, DateTime};
 
 const BUF_LEN: usize = 1024; // Buffer size for reading from the stream
 const PROTOCOL_VERSION: i32 = 196608; // 3.0.0 in PostgreSQL protocol versioning
@@ -378,6 +379,17 @@ pub fn process_simple_query(
                     };
                     off += msg_len as usize + 1;
                 }
+                b'W' => {
+                    // 'W' for CopyBothResponse
+                    let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
+                    // Do something useful here?..
+                    size = if size >= msg_len as usize {
+                        size - msg_len as usize
+                    } else {
+                        0
+                    };
+                    off += msg_len as usize + 1;
+                }
                 b'D' => {
                     // 'D' for DataRow
 
@@ -415,6 +427,88 @@ pub fn process_simple_query(
                         0
                     };
                     off += msg_len as usize + 1;
+                    if off >= cpy_size {
+                        return Ok(is_done);
+                    }
+                }
+                b'c' => {
+                    is_done = true;
+                    break 'attempt_read;
+                }
+                b'd' => {
+                    // 'd' for CopyData
+                    if off + 5 > cpy_size {
+                        state.overflowed = true;
+                        state.overflow_buf.clear();
+                        state.overflow_buf.put_slice(&buf[off..cpy_size]);
+                        state.skip_bytes = buf[off..cpy_size].len() as u32;
+                        break;
+                    }
+
+                    let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
+                    if state.data_buf_off + msg_len as usize >= data_buf.len() {
+                        // Prevent overflow
+                        state.overflow_buf.clear();
+                        state.overflow_buf.put_slice(&buf[off..cpy_size]);
+                        state.skip_bytes = buf[off..cpy_size].len() as u32;
+                        state.data_buf_off = 0; // Reset offset
+                        return Ok(is_done);
+                    }
+
+                    if off + msg_len as usize + 1 > cpy_size {
+                        state.overflowed = true;
+                        state.overflow_buf.clear();
+                        state.overflow_buf.put_slice(&buf[off..cpy_size]);
+                        state.skip_bytes = buf[off..cpy_size].len() as u32;
+                        break;
+                    }
+
+                    let msg_data = &buf[off + 5..off + msg_len as usize + 1];
+                    match msg_data[0] {
+                        b'k' => {
+                            // 'k' for Keepalive message
+                            let end_of_wal = (&msg_data[1..9]).get_i64();
+                            if msg_data[17] == 1 {
+                                // Reply requested
+                                println!("Keepalive reply requested");
+                                let mut resp_buf = BytesMut::new();
+                                let now: DateTime<Utc> = Utc::now();
+
+                                // Respond to keep the connection alive
+                                resp_buf.put_u8(b'd'); // identify message as CopyData
+                                let start_pos = resp_buf.len();
+                                resp_buf.put_i32(0); // Placeholder for length
+                                resp_buf.put_u8(b'r'); // Standby status update
+                                resp_buf.put_i64(end_of_wal+1); // The location of the last WAL byte + 1 received and written to disk in the standby.
+                                resp_buf.put_i64(end_of_wal+1); // The location of the last WAL byte + 1 flushed to disk in the standby.
+                                resp_buf.put_i64(end_of_wal+1); // The location of the last WAL byte + 1 applied in the standby.
+                                resp_buf.put_i64(now.timestamp_micros()); // The client's system clock at the time of transmission, as microseconds since midnight on 2000-01-01.
+                                resp_buf.put_u8(0); // Reply is not required
+
+                                let total_len = resp_buf[start_pos..].len() as i32;
+                                add_buf_len(&mut resp_buf, start_pos, total_len);
+
+                                if let Err(e) = stream.write(&resp_buf) {
+                                    return Err(format!(
+                                        "Failed to write keepalive response to stream: {}",
+                                        e
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    data_buf[state.data_buf_off..state.data_buf_off + msg_data.len()]
+                        .copy_from_slice(msg_data);
+                    state.data_buf_off += msg_data.len();
+
+                    size = if size >= msg_len as usize {
+                        size - msg_len as usize
+                    } else {
+                        0
+                    };
+                    off += msg_len as usize + 1;
+
                     if off >= cpy_size {
                         return Ok(is_done);
                     }
