@@ -84,7 +84,7 @@ Row Description: "id|k"    // Columns
 Data Buffer: "1|1002 2|1003 3|1004 4|1005 "  // Row Data
 ```
 
-You can also use the simple `psql` like example tool with the `cargo run --example psql` command. Ensure to update the configuration values in the [psql](examples/psql.rs) file before running the command
+You can also use the simple `psql` like example tool with the `cargo run --example simpsql` command. Ensure to update the configuration values in the [psql](examples/psql.rs) file before running the command
 This will show results as follows(assuming `foo` table was created using the SQL above)
 ```
 Client connection
