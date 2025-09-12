@@ -73,6 +73,7 @@ fn main() {
                     _ => (),
                 }
 
+                let buf_is_cleared = false;
                 loop {
                     stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap(); // Set a timeout to avoid blocking indefinitely
                     state.data_buf_off = 0;
@@ -104,6 +105,13 @@ fn main() {
                     }
                     if let Err(e) = io::stdout().write_all(&result_buf[..state.data_buf_off]) {
                         eprintln!("Error when writing to stdout for DataRow: {}", e);
+                    }
+
+                    result_buf.fill(0);
+
+                    if !buf_is_cleared {
+                        // Clear only once
+                        row_descr.clear();
                     }
 
                 }
