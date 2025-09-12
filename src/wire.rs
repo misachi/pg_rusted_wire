@@ -21,7 +21,7 @@ pub struct StartupMsg {
     user: String,
     database: Option<String>,
     options: Option<String>,
-    replication: Option<bool>,
+    replication: Option<String>,
 }
 
 #[derive(Debug)]
@@ -897,7 +897,7 @@ impl StartupMsg {
         user: String,
         database: Option<String>,
         options: Option<String>,
-        replication: Option<bool>,
+        replication: Option<String>,
     ) -> Self {
         StartupMsg {
             protocol: PROTOCOL_VERSION,
@@ -924,14 +924,16 @@ impl StartupMsg {
             put_cstring(&mut bytes, "options");
             put_cstring(&mut bytes, opts);
         }
-        put_cstring(&mut bytes, "replication");
-        match self.replication {
-            None => {
-                self.replication = Some(false);
+
+        match &self.replication {
+            Some(dat) => {
+                put_cstring(&mut bytes, "replication");
+                put_cstring(&mut bytes, &dat);
+                // self.replication = Some("".to_string());
             }
-            _ => {}
+            _ => (),
         }
-        put_cstring(&mut bytes, &self.replication.unwrap_or(false).to_string());
+
         put_cstring(&mut bytes, "");
 
         let total_len = bytes.len() as i32;
@@ -993,7 +995,7 @@ mod tests {
             "user1".to_string(),
             Some("db1".to_string()),
             Some("opt1".to_string()),
-            Some(true),
+            None,
         );
         let bytes = msg.to_bytes();
         // Should start with length and protocol version
