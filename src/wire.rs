@@ -1,13 +1,25 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::{Buf, BufMut, BytesMut};
+use chrono::{DateTime, Utc};
 use std::fmt::Debug;
 use std::io::{Read, Write, stdout};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
-use chrono::{Utc, DateTime};
 
 const BUF_LEN: usize = 1024; // Buffer size for reading from the stream
 const PROTOCOL_VERSION: i32 = 196608; // 3.0.0 in PostgreSQL protocol versioning
+
+#[derive(Debug, Default)]
+struct TableInfo {
+    name: String,
+    oid: i32,
+    namespace: String,
+    ncols: i16,        // Number of columns
+    cols: Vec<String>, // Column names
+    slot: String,      // Slot name
+    path: String,
+    last_committed_txn: i64,
+}
 
 pub struct QueryState {
     pub overflowed: bool,
@@ -135,6 +147,17 @@ pub fn put_cstring(buf: &mut BytesMut, input: &str) {
     buf.put_u8(b'\0');
 }
 
+#[derive(Debug)]
+pub enum SimpleQueryCompletion {
+    InProgress,
+    InProgressReadStream,
+    CopyComplete,
+    CommandComplete,
+    CommandError,
+    CopyError,
+    NoMatch,
+}
+
 pub fn get_auth_type(_type: i32) -> AuthenticationType {
     // This function is a placeholder for determining the authentication type
     // In a real implementation, this would likely involve a bit more complex logic
@@ -240,6 +263,165 @@ pub fn send_simple_query(stream: &mut TcpStream, msg: &str) -> Option<String> {
         return Some(format!("Failed to write query to stream: {}", e));
     }
     None
+}
+
+fn process_simple_query_codes(
+    buf: &[u8],
+    off: &mut usize,
+    cpy_size: usize,
+    size: &mut usize,
+    data_buf: &mut [u8],
+    row_descr: &mut BytesMut,
+    state: &mut QueryState,
+) -> SimpleQueryCompletion {
+    let mut is_done = SimpleQueryCompletion::NoMatch;
+    let code = buf[*off..][0];
+    match code {
+        b'C' => {
+            // 'C' for CommandComplete
+            // let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
+
+            // // Check for Query ready
+            // if (off + msg_len as usize + 1) < response.len() && response[off + msg_len as usize + 1..][0] == b'Z' {
+            //     is_done = true;
+            //     // break 'attempt_read;
+            // }
+            is_done = SimpleQueryCompletion::CommandComplete;
+            // break 'attempt_read;
+        }
+        b'Z' => {
+            // 'Z' for ReadyForQuery. TODO: Process different states
+            let msg_len: i32 = (&buf[1..5]).get_i32();
+
+            *size = if *size >= msg_len as usize {
+                *size - msg_len as usize
+            } else {
+                0
+            };
+            *off += msg_len as usize + 1;
+            is_done = SimpleQueryCompletion::InProgress;
+        }
+        b'I' => {
+            // 'I' for EmptyQueryResponse
+            let msg_len: i32 = (&buf[1..5]).get_i32();
+            eprintln!("Empty Query Response with length: {}", msg_len);
+            is_done = SimpleQueryCompletion::CommandError;
+            // break 'attempt_read;
+        }
+        b'E' => {
+            // 'E' for ErrorResponse
+            let msg_len: i32 = (&buf[1..5]).get_i32();
+            let char_idx_fn = |buf: &[u8], key: u8| -> usize {
+                let mut r = 0;
+                for ch in buf {
+                    if *ch == key {
+                        break;
+                    }
+                    r += 1;
+                }
+                r as usize
+            };
+
+            // See https://www.postgresql.org/docs/17/protocol-error-fields.html#PROTOCOL-ERROR-FIELDS
+            let out_msg = || -> BytesMut {
+                let mut _off: usize = 0;
+                let mut msg_out = BytesMut::with_capacity(BUF_LEN);
+
+                _off += 6;
+                while _off < msg_len as usize {
+                    let mut err_msg: &[u8];
+
+                    if buf[_off] == b'V' {
+                        _off += 1; // Skip error severity character
+                        err_msg = &buf[_off..];
+                        let end = char_idx_fn(err_msg, b'\0');
+                        msg_out.put_slice(&err_msg[..end]);
+                        _off += end; // Advance
+                        msg_out.put_slice(": ".as_bytes());
+                    }
+
+                    if buf[_off] == b'M' {
+                        _off += 1; // Skip error message character
+                        err_msg = &buf[_off..];
+                        let end = char_idx_fn(err_msg, b'\0');
+                        msg_out.put_slice(&err_msg[..end]);
+                        _off += end; // Advance
+                        break;
+                    }
+                    _off += 1;
+                }
+                msg_out
+            }();
+
+            if let Err(e) = stdout().write_all(&out_msg) {
+                eprintln!("Simple Query Error: {}", e);
+            }
+            is_done = SimpleQueryCompletion::CommandError;
+            // break 'attempt_read;
+        }
+        b'T' => {
+            // T for RowDescription
+            let msg_len: i32 = (&buf[1..5]).get_i32();
+            let num_cols = (&buf[*off + 5..*off + 7]).get_i16();
+
+            let val_off = *off + 5 + 2; // Account for byte, 4 byte for content size, 2 bytes for column number
+            format_row_desc(val_off, num_cols, &buf, row_descr);
+
+            *size = if *size >= msg_len as usize {
+                *size - msg_len as usize
+            } else {
+                0
+            };
+            *off += msg_len as usize + 1;
+            is_done = SimpleQueryCompletion::InProgress;
+        }
+        b'D' => {
+            // 'D' for DataRow
+
+            // Check if we have enough data to read full message length. If not,
+            // put in overflow buffer to be handled later
+            if *off + 5 > cpy_size {
+                state.overflowed = true;
+                state.overflow_buf.clear();
+                state.overflow_buf.put_slice(&buf[*off..cpy_size]);
+                state.skip_bytes = buf[*off..cpy_size].len() as u32;
+                return SimpleQueryCompletion::InProgressReadStream;
+            }
+            let msg_len: i32 = (&buf[*off + 1..*off + 5]).get_i32();
+
+            // Check if the message length exceeds the available data
+            // If so, put in overflow buffer to be handled later
+            if *off + msg_len as usize + 1 > cpy_size {
+                state.overflowed = true;
+                state.overflow_buf.clear();
+                state.overflow_buf.put_slice(&buf[*off..cpy_size]);
+                state.skip_bytes = buf[*off..cpy_size].len() as u32;
+                return SimpleQueryCompletion::InProgressReadStream;
+            }
+            let num_cols = (&buf[*off + 5..*off + 7]).get_i16();
+
+            let val_off = *off + 5 + 2; // Account for byte, 4 byte for content size, 2 bytes for column number
+            format_data_row(val_off, num_cols, &buf, data_buf, state);
+
+            if state.skip_bytes > 0 {
+                return is_done;
+            }
+
+            *size = if *size >= msg_len as usize {
+                *size - msg_len as usize
+            } else {
+                0
+            };
+            *off += msg_len as usize + 1;
+            if *off >= cpy_size {
+                return is_done;
+            }
+            is_done = SimpleQueryCompletion::InProgress;
+        }
+        _ => (),
+    }
+
+    is_done
 }
 
 pub fn process_simple_query(
@@ -379,17 +561,6 @@ pub fn process_simple_query(
                     };
                     off += msg_len as usize + 1;
                 }
-                b'W' => {
-                    // 'W' for CopyBothResponse
-                    let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
-                    // Do something useful here?..
-                    size = if size >= msg_len as usize {
-                        size - msg_len as usize
-                    } else {
-                        0
-                    };
-                    off += msg_len as usize + 1;
-                }
                 b'D' => {
                     // 'D' for DataRow
 
@@ -431,88 +602,6 @@ pub fn process_simple_query(
                         return Ok(is_done);
                     }
                 }
-                b'c' => {
-                    is_done = true;
-                    break 'attempt_read;
-                }
-                b'd' => {
-                    // 'd' for CopyData
-                    if off + 5 > cpy_size {
-                        state.overflowed = true;
-                        state.overflow_buf.clear();
-                        state.overflow_buf.put_slice(&buf[off..cpy_size]);
-                        state.skip_bytes = buf[off..cpy_size].len() as u32;
-                        break;
-                    }
-
-                    let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
-                    if state.data_buf_off + msg_len as usize >= data_buf.len() {
-                        // Prevent overflow
-                        state.overflow_buf.clear();
-                        state.overflow_buf.put_slice(&buf[off..cpy_size]);
-                        state.skip_bytes = buf[off..cpy_size].len() as u32;
-                        state.data_buf_off = 0; // Reset offset
-                        return Ok(is_done);
-                    }
-
-                    if off + msg_len as usize + 1 > cpy_size {
-                        state.overflowed = true;
-                        state.overflow_buf.clear();
-                        state.overflow_buf.put_slice(&buf[off..cpy_size]);
-                        state.skip_bytes = buf[off..cpy_size].len() as u32;
-                        break;
-                    }
-
-                    let msg_data = &buf[off + 5..off + msg_len as usize + 1];
-                    match msg_data[0] {
-                        b'k' => {
-                            // 'k' for Keepalive message
-                            let end_of_wal = (&msg_data[1..9]).get_i64();
-                            if msg_data[17] == 1 {
-                                // Reply requested
-                                println!("Keepalive reply requested");
-                                let mut resp_buf = BytesMut::new();
-                                let now: DateTime<Utc> = Utc::now();
-
-                                // Respond to keep the connection alive
-                                resp_buf.put_u8(b'd'); // identify message as CopyData
-                                let start_pos = resp_buf.len();
-                                resp_buf.put_i32(0); // Placeholder for length
-                                resp_buf.put_u8(b'r'); // Standby status update
-                                resp_buf.put_i64(end_of_wal+1); // The location of the last WAL byte + 1 received and written to disk in the standby.
-                                resp_buf.put_i64(end_of_wal+1); // The location of the last WAL byte + 1 flushed to disk in the standby.
-                                resp_buf.put_i64(end_of_wal+1); // The location of the last WAL byte + 1 applied in the standby.
-                                resp_buf.put_i64(now.timestamp_micros()); // The client's system clock at the time of transmission, as microseconds since midnight on 2000-01-01.
-                                resp_buf.put_u8(0); // Reply is not required
-
-                                let total_len = resp_buf[start_pos..].len() as i32;
-                                add_buf_len(&mut resp_buf, start_pos, total_len);
-
-                                if let Err(e) = stream.write(&resp_buf) {
-                                    return Err(format!(
-                                        "Failed to write keepalive response to stream: {}",
-                                        e
-                                    ));
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    data_buf[state.data_buf_off..state.data_buf_off + msg_data.len()]
-                        .copy_from_slice(msg_data);
-                    state.data_buf_off += msg_data.len();
-
-                    size = if size >= msg_len as usize {
-                        size - msg_len as usize
-                    } else {
-                        0
-                    };
-                    off += msg_len as usize + 1;
-
-                    if off >= cpy_size {
-                        return Ok(is_done);
-                    }
-                }
                 _ => {
                     // Handle incomplete data in read buffer(Alot to improve here)
                     if state.overflowed && state.skip_bytes > 0 {
@@ -546,6 +635,269 @@ pub fn process_simple_query(
                         } else {
                             0
                         };
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(is_done)
+}
+
+pub fn process_logical_repl(
+    stream: &mut TcpStream,
+    data_buf: &mut [u8],
+    row_descr: &mut BytesMut,
+    state: &mut QueryState,
+) -> Result<SimpleQueryCompletion, String> {
+    let mut buf = [0; BUF_LEN]; // Buffer to read response
+    let mut buf_off = 0;
+    let mut is_done: SimpleQueryCompletion;
+
+    if state.skip_bytes > 0 {
+        buf[..state.skip_bytes as usize]
+            .copy_from_slice(&state.overflow_buf[..state.skip_bytes as usize]);
+        buf_off += state.skip_bytes as usize;
+        state.skip_bytes = 0;
+    }
+
+    'attempt_read: loop {
+        let mut size: usize;
+        match stream.read(&mut buf[buf_off..]) {
+            Ok(r_size) => {
+                if r_size <= 0 {
+                    return Err("Server closed the connection".to_string());
+                }
+
+                if r_size > BUF_LEN {
+                    return Err("Received data exceeds buffer size".to_string());
+                }
+                size = r_size + buf_off;
+                buf_off = 0;
+            }
+            Err(e) => {
+                return Err(format!("Failed to read from stream: {}", e));
+            }
+        }
+
+        let response = &buf[..size];
+        let mut off = 0;
+        let cpy_size = size;
+        while size > 0 && off < cpy_size {
+            let code = response[off..][0];
+            is_done = process_simple_query_codes(
+                &buf, &mut off, cpy_size, &mut size, data_buf, row_descr, state,
+            );
+            match is_done {
+                SimpleQueryCompletion::CommandComplete => break 'attempt_read,
+                SimpleQueryCompletion::CommandError => break 'attempt_read,
+                SimpleQueryCompletion::InProgressReadStream => break,
+                SimpleQueryCompletion::InProgress => (),
+                _ => {
+                    is_done = SimpleQueryCompletion::InProgress;
+                    match code {
+                        b'f' => {
+                            // CopyFail
+                            let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
+
+                            // size = if size >= msg_len as usize {
+                            //     size - msg_len as usize
+                            // } else {
+                            //     0
+                            // };
+                            let err_msg = &buf[off + 5..off + msg_len as usize + 1];
+                            // off += msg_len as usize + 1;
+                            eprintln!("Copy Error: {:?}", String::from_utf8_lossy(err_msg));
+                            is_done = SimpleQueryCompletion::CopyError;
+                            break 'attempt_read;
+                            // Stop??
+                        }
+                        b'W' => {
+                            // 'W' for CopyBothResponse
+                            let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
+                            // Do something useful here?..
+                            size = if size >= msg_len as usize {
+                                size - msg_len as usize
+                            } else {
+                                0
+                            };
+                            off += msg_len as usize + 1;
+                        }
+                        b'c' => {
+                            // CopyDone
+                            is_done = SimpleQueryCompletion::CopyComplete;
+                            break 'attempt_read;
+                        }
+                        b'H' => {
+                            // CopyOutResponse
+                            let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
+
+                            size = if size >= msg_len as usize {
+                                size - msg_len as usize
+                            } else {
+                                0
+                            };
+                            off += msg_len as usize + 1;
+                        }
+                        b'd' => {
+                            // 'd' for CopyData
+                            if off + 5 > cpy_size {
+                                state.overflowed = true;
+                                state.overflow_buf.clear();
+                                state.overflow_buf.put_slice(&buf[off..cpy_size]);
+                                state.skip_bytes = buf[off..cpy_size].len() as u32;
+                                break;
+                            }
+
+                            let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
+                            if state.data_buf_off + msg_len as usize >= data_buf.len() {
+                                // Prevent overflow
+                                state.overflow_buf.clear();
+                                state.overflow_buf.put_slice(&buf[off..cpy_size]);
+                                state.skip_bytes = buf[off..cpy_size].len() as u32;
+                                state.data_buf_off = 0; // Reset offset
+                                return Ok(is_done);
+                            }
+
+                            if off + msg_len as usize + 1 > cpy_size {
+                                state.overflowed = true;
+                                state.overflow_buf.clear();
+                                state.overflow_buf.put_slice(&buf[off..cpy_size]);
+                                state.skip_bytes = buf[off..cpy_size].len() as u32;
+                                break;
+                            }
+
+                            let msg_data = &buf[off + 5..off + msg_len as usize + 1];
+                            match msg_data[0] {
+                                b'k' => {
+                                    // 'k' for Keepalive message
+                                    let end_of_wal = (&msg_data[1..9]).get_i64();
+                                    if msg_data[17] == 1 {
+                                        // Reply requested
+                                        println!("Keepalive reply requested");
+                                        let mut resp_buf = BytesMut::new();
+                                        let now: DateTime<Utc> = Utc::now();
+
+                                        // Respond to keep the connection alive
+                                        resp_buf.put_u8(b'd'); // identify message as CopyData
+                                        let start_pos = resp_buf.len();
+                                        resp_buf.put_i32(0); // Placeholder for length
+                                        resp_buf.put_u8(b'r'); // Standby status update
+                                        resp_buf.put_i64(end_of_wal + 1); // The location of the last WAL byte + 1 received and written to disk in the standby.
+                                        resp_buf.put_i64(end_of_wal + 1); // The location of the last WAL byte + 1 flushed to disk in the standby.
+                                        resp_buf.put_i64(end_of_wal + 1); // The location of the last WAL byte + 1 applied in the standby.
+                                        resp_buf.put_i64(now.timestamp_micros()); // The client's system clock at the time of transmission, as microseconds since midnight on 2000-01-01.
+                                        resp_buf.put_u8(0); // Reply is not required
+
+                                        let total_len = resp_buf[start_pos..].len() as i32;
+                                        add_buf_len(&mut resp_buf, start_pos, total_len);
+
+                                        if let Err(e) = stream.write(&resp_buf) {
+                                            return Err(format!(
+                                                "Failed to write keepalive response to stream: {}",
+                                                e
+                                            ));
+                                        }
+                                    }
+                                }
+                                b'w' => {
+                                    let xlog_data = &msg_data[25..];
+                                    match xlog_data[0] {
+                                        b'B' => {
+                                            // BEGIN
+                                            println!("XLogData: BEGIN");
+                                        }
+                                        b'I' => {
+                                            // INSERT
+                                            let tuple_data = &xlog_data[10..];
+                                            println!(
+                                                "XLogData: {:?}",
+                                                String::from_utf8_lossy(tuple_data)
+                                            );
+                                            data_buf[state.data_buf_off
+                                                ..state.data_buf_off + tuple_data.len()]
+                                                .copy_from_slice(tuple_data);
+                                            state.data_buf_off += tuple_data.len();
+                                        }
+                                        b'U' => { // UPDATE
+                                        }
+                                        b'D' => {
+                                            // DELETE
+                                        }
+                                        b'R' => { // RELATION
+                                        }
+                                        b'C' => {
+                                            // COMMIT
+                                            println!("XLogData: COMMIT");
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                _ => {
+                                    data_buf
+                                        [state.data_buf_off..state.data_buf_off + msg_data.len()]
+                                        .copy_from_slice(msg_data);
+                                    state.data_buf_off += msg_data.len();
+                                }
+                            }
+
+                            size = if size >= (msg_len as usize) {
+                                size - msg_len as usize
+                            } else {
+                                0
+                            };
+                            off += msg_len as usize + 1;
+
+                            if off >= cpy_size {
+                                return Ok(is_done);
+                            }
+                        }
+                        _ => {
+                            // Handle incomplete data in read buffer(Alot to improve here)
+                            if state.overflowed && state.skip_bytes > 0 {
+                                state.overflow_buf.put_slice(&buf[..cpy_size]); // What??
+                                let msg_len: i32 = (&state.overflow_buf[1..5]).get_i32();
+                                state.skip_bytes = (msg_len + 1) as u32 - state.skip_bytes;
+
+                                size = if size >= (state.skip_bytes as usize) {
+                                    size - state.skip_bytes as usize
+                                } else {
+                                    0
+                                };
+                                off += state.skip_bytes as usize;
+
+                                let val_off = 5; // Account for byte, 4 byte for content size
+
+                                //TODO: CLean this up. Not looking good
+                                let mut buf = BytesMut::with_capacity(state.overflow_buf.len());
+                                buf.put_slice(&state.overflow_buf);
+
+                                let data: &[u8];
+                                if msg_len as usize + 1 < buf.len() {
+                                    data = &buf[val_off..msg_len as usize + 1];
+                                } else {
+                                    data = &buf[val_off..];
+                                }
+                                data_buf[state.data_buf_off..state.data_buf_off + data.len()]
+                                    .copy_from_slice(data);
+                                state.data_buf_off += data.len();
+
+                                state.overflow_buf.clear();
+                                state.overflowed = false;
+                                state.skip_bytes = 0;
+                            } else {
+                                let msg_len: i32 = (&buf[1..5]).get_i32();
+                                eprintln!(
+                                    "Unexpected message type when processing simple query: {:?}",
+                                    String::from_utf8_lossy(&buf[0].to_le_bytes())
+                                );
+                                size = if size >= msg_len as usize {
+                                    size - msg_len as usize
+                                } else {
+                                    0
+                                };
+                            }
+                        }
                     }
                 }
             }
