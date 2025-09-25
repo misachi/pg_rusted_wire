@@ -2,10 +2,10 @@
 /// Run: lrepl -u prom_pg_exporter -P prom_pg_exporter -H 172.17.0.1 -d postgres -p 5432 --table <name>
 /// Help: lrepl -h
 use bytes::{BufMut, BytesMut};
+use clap::Parser;
 use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
-use clap::Parser;
 
 use pg_rusted_wire::wire::*;
 
@@ -29,7 +29,7 @@ struct RustedCli {
     #[arg(short = 'd', long, default_value_t = DEFAULT_DATABASE.to_string())]
     database: String,
     #[arg(short, long)]
-    table: String
+    table: String,
 }
 
 fn process_simple(
@@ -37,17 +37,17 @@ fn process_simple(
     state: &mut QueryState,
     result_buf: &mut [u8],
     row_descr: &mut BytesMut,
-) -> Result<SimpleQueryCompletion, String> {
+) -> Result<SimpleQueryCompletion, SimpleQueryError> {
     // stream.set_read_timeout(Some(Duration::from_millis(1000))).unwrap(); // Set a timeout to avoid blocking indefinitely
     state.data_buf_off = 0;
 
     let ret = process_logical_repl(stream, result_buf, row_descr, state);
     row_descr.put_u8(b'\n');
     if let Err(e) = io::stdout().write_all(&row_descr) {
-        return Err(format!(
+        return Err(SimpleQueryError(format!(
             "Error when writing to stdout for RowDescription: {}",
             e
-        ));
+        )));
     }
     if let Err(e) = io::stdout().write_all(&result_buf) {
         eprintln!("Error when writing to stdout for DataRow: {}", e);

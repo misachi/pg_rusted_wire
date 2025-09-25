@@ -2,12 +2,30 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::{Buf, BufMut, BytesMut};
 use chrono::{DateTime, Utc};
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::io::{Read, Write, stdout};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 
 const BUF_LEN: usize = 1024; // Buffer size for reading from the stream
 const PROTOCOL_VERSION: i32 = 196608; // 3.0.0 in PostgreSQL protocol versioning
+
+#[derive(Debug)]
+pub struct SimpleQueryError(pub String);
+
+impl fmt::Display for SimpleQueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug)]
+pub struct AuthError(pub String);
+
+impl fmt::Display for AuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 #[derive(Debug, Default)]
 struct TableInfo {
@@ -18,7 +36,6 @@ struct TableInfo {
     cols: Vec<String>, // Column names
     slot: String,      // Slot name
     path: String,
-    last_committed_txn: i64,
 }
 
 pub struct QueryState {
@@ -67,23 +84,23 @@ impl Client {
         stream: &mut TcpStream,
         startup_msg: &mut StartupMsg,
         pass: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), AuthError> {
         let msg_bytes = startup_msg.to_bytes();
         let mut buf = [0; BUF_LEN]; // Buffer to read response
 
         if let Err(e) = stream.write(&msg_bytes) {
-            return Err(format!("Failed to write to stream: {}", e));
+            return Err(AuthError(format!("Failed to write to stream: {}", e)));
         }
 
         loop {
             match stream.read(&mut buf) {
                 Ok(size) => {
                     if size <= 0 {
-                        return Err(format!("Server closed the connection"));
+                        return Err(AuthError(format!("Server closed the connection")));
                     }
 
                     if size > BUF_LEN {
-                        return Err(format!("Received data exceeds buffer size"));
+                        return Err(AuthError(format!("Received data exceeds buffer size")));
                     }
                     let response = &buf[..size];
 
@@ -112,12 +129,12 @@ impl Client {
                             }
                         }
                         _ => {
-                            return Err(format!("Unexpected message type: {}", response[0]));
+                            return Err(AuthError(format!("Unexpected message type: {}", response[0])));
                         }
                     }
                 }
                 Err(e) => {
-                    return Err(format!("Failed to read from stream: {}", e));
+                    return Err(AuthError(format!("Failed to read from stream: {}", e)));
                 }
             }
         }
@@ -247,7 +264,7 @@ fn format_data_row(
     state.data_buf_off += 1;
 }
 
-pub fn send_simple_query(stream: &mut TcpStream, msg: &str) -> Option<String> {
+pub fn send_simple_query(stream: &mut TcpStream, msg: &str) -> Option<SimpleQueryError> {
     let mut bytes = BytesMut::new();
 
     bytes.put_u8(b'Q'); // Query message type
@@ -260,7 +277,10 @@ pub fn send_simple_query(stream: &mut TcpStream, msg: &str) -> Option<String> {
     add_buf_len(&mut bytes, start_pos, buf_len);
 
     if let Err(e) = stream.write(&bytes) {
-        return Some(format!("Failed to write query to stream: {}", e));
+        return Some(SimpleQueryError(format!(
+            "Failed to write query to stream: {}",
+            e
+        )));
     }
     None
 }
@@ -429,7 +449,7 @@ pub fn process_simple_query(
     data_buf: &mut [u8],
     row_descr: &mut BytesMut,
     state: &mut QueryState,
-) -> Result<bool, String> {
+) -> Result<bool, SimpleQueryError> {
     let mut buf = [0; BUF_LEN]; // Buffer to read response
     let mut buf_off = 0;
     let mut is_done = false;
@@ -446,17 +466,22 @@ pub fn process_simple_query(
         match stream.read(&mut buf[buf_off..]) {
             Ok(r_size) => {
                 if r_size <= 0 {
-                    return Err("Server closed the connection".to_string());
+                    return Err(SimpleQueryError("Server closed the connection".to_string()));
                 }
 
                 if r_size > BUF_LEN {
-                    return Err("Received data exceeds buffer size".to_string());
+                    return Err(SimpleQueryError(
+                        "Received data exceeds buffer size".to_string(),
+                    ));
                 }
                 size = r_size + buf_off;
                 buf_off = 0;
             }
             Err(e) => {
-                return Err(format!("Failed to read from stream: {}", e));
+                return Err(SimpleQueryError(format!(
+                    "Failed to read from stream: {}",
+                    e
+                )));
             }
         }
 
@@ -649,7 +674,7 @@ pub fn process_logical_repl(
     data_buf: &mut [u8],
     row_descr: &mut BytesMut,
     state: &mut QueryState,
-) -> Result<SimpleQueryCompletion, String> {
+) -> Result<SimpleQueryCompletion, SimpleQueryError> {
     let mut buf = [0; BUF_LEN]; // Buffer to read response
     let mut buf_off = 0;
     let mut is_done: SimpleQueryCompletion;
@@ -666,17 +691,22 @@ pub fn process_logical_repl(
         match stream.read(&mut buf[buf_off..]) {
             Ok(r_size) => {
                 if r_size <= 0 {
-                    return Err("Server closed the connection".to_string());
+                    return Err(SimpleQueryError("Server closed the connection".to_string()));
                 }
 
                 if r_size > BUF_LEN {
-                    return Err("Received data exceeds buffer size".to_string());
+                    return Err(SimpleQueryError(
+                        "Received data exceeds buffer size".to_string(),
+                    ));
                 }
                 size = r_size + buf_off;
                 buf_off = 0;
             }
             Err(e) => {
-                return Err(format!("Failed to read from stream: {}", e));
+                return Err(SimpleQueryError(format!(
+                    "Failed to read from stream: {}",
+                    e
+                )));
             }
         }
 
@@ -793,10 +823,10 @@ pub fn process_logical_repl(
                                         add_buf_len(&mut resp_buf, start_pos, total_len);
 
                                         if let Err(e) = stream.write(&resp_buf) {
-                                            return Err(format!(
+                                            return Err(SimpleQueryError(format!(
                                                 "Failed to write keepalive response to stream: {}",
                                                 e
-                                            ));
+                                            )));
                                         }
                                     }
                                 }
@@ -913,7 +943,7 @@ mod md5password {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    use crate::wire::{BUF_LEN, add_buf_len, decoded_password, encode_password};
+    use crate::wire::{BUF_LEN, add_buf_len, decoded_password, encode_password, AuthError};
 
     #[derive(Debug)]
     pub struct MD5Pass {
@@ -961,7 +991,7 @@ mod md5password {
             ret_vec
         }
 
-        pub fn authenticate(&self, stream: &mut TcpStream, _read_buf: &[u8]) -> Result<(), String> {
+        pub fn authenticate(&self, stream: &mut TcpStream, _read_buf: &[u8]) -> Result<(), AuthError> {
             let mut buf = BytesMut::with_capacity(BUF_LEN);
             buf.put_u8(b'p'); // identify message as PasswordMessage
 
@@ -974,10 +1004,10 @@ mod md5password {
             add_buf_len(&mut buf, start_pos, total_len);
 
             if let Err(e) = stream.write(&buf) {
-                return Err(format!(
+                return Err(AuthError(format!(
                     "Failed to write to stream for clear md5 password initial response: {}",
                     e
-                ));
+                )));
             }
 
             buf.fill(0);
@@ -986,23 +1016,23 @@ mod md5password {
                     let response = &buf[..size];
 
                     if response[0] != b'R' {
-                        return Err(format!(
+                        return Err(AuthError(format!(
                             "Invalid response in AuthenticationOk message: {:?}",
                             response[0]
-                        ));
+                        )));
                     }
 
                     let complete_tag = (&response[5..9]).get_i32(); // Check 4 byte value for completion status
                     if complete_tag != 0 {
                         // 0 signifies SASL authentication was successful(AuthenticationOk )
-                        return Err(format!("Auth incomplete: {}", complete_tag));
+                        return Err(AuthError(format!("Auth incomplete: {}", complete_tag)));
                     }
                 }
                 Err(e) => {
-                    return Err(format!(
+                    return Err(AuthError(format!(
                         "Failed to read from stream for AuthenticationOk: {}",
                         e
-                    ));
+                    )));
                 }
             }
 
@@ -1016,7 +1046,7 @@ mod textpassword {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    use crate::wire::{BUF_LEN, add_buf_len, decoded_password, encode_password};
+    use crate::wire::{BUF_LEN, add_buf_len, decoded_password, encode_password, AuthError};
 
     #[derive(Debug)]
     pub struct ClearTextPass {
@@ -1030,7 +1060,7 @@ mod textpassword {
             }
         }
 
-        pub fn authenticate(&self, stream: &mut TcpStream, _read_buf: &[u8]) -> Result<(), String> {
+        pub fn authenticate(&self, stream: &mut TcpStream, _read_buf: &[u8]) -> Result<(), AuthError> {
             let mut buf = BytesMut::with_capacity(BUF_LEN);
             buf.put_u8(b'p'); // identify message as PasswordMessage
 
@@ -1047,10 +1077,10 @@ mod textpassword {
             add_buf_len(&mut buf, start_pos, total_len);
 
             if let Err(e) = stream.write(&buf) {
-                return Err(format!(
+                return Err(AuthError(format!(
                     "Failed to write to stream for clear text password initial response: {}",
                     e
-                ));
+                )));
             }
 
             buf.fill(0);
@@ -1059,23 +1089,23 @@ mod textpassword {
                     let response = &buf[..size];
 
                     if response[0] != b'R' {
-                        return Err(format!(
+                        return Err(AuthError(format!(
                             "Invalid response in AuthenticationOk message: {:?}",
                             response[0]
-                        ));
+                        )));
                     }
 
                     let complete_tag = (&response[5..9]).get_i32(); // Check 4 byte value for completion status
                     if complete_tag != 0 {
                         // 0 signifies SASL authentication was successful(AuthenticationOk )
-                        return Err(format!("Auth incomplete: {}", complete_tag));
+                        return Err(AuthError(format!("Auth incomplete: {}", complete_tag)));
                     }
                 }
                 Err(e) => {
-                    return Err(format!(
+                    return Err(AuthError(format!(
                         "Failed to read from stream for AuthenticationOk: {}",
                         e
-                    ));
+                    )));
                 }
             }
 
@@ -1095,7 +1125,7 @@ mod sasl {
     use std::net::TcpStream;
     use std::ops::BitXor;
 
-    use crate::wire::{BUF_LEN, add_buf_len, decoded_password, encode_password};
+    use crate::wire::{BUF_LEN, add_buf_len, decoded_password, encode_password, AuthError};
 
     #[derive(Debug)]
     pub struct SASL {
@@ -1155,7 +1185,7 @@ mod sasl {
             pass: &[u8],
             stream: &mut TcpStream,
             resp_data: &[u8],
-        ) -> Result<(), String> {
+        ) -> Result<(), AuthError> {
             let resp_str = String::from_utf8(resp_data.to_vec());
             if let Ok(val) = resp_str {
                 let data = val.split(',').collect::<Vec<&str>>();
@@ -1163,7 +1193,7 @@ mod sasl {
                 let decoded_salt = match STANDARD.decode(&data[1][2..]) {
                     Ok(s) => s,
                     Err(e) => {
-                        return Err(format!("Decoding error: {}", e));
+                        return Err(AuthError(format!("Decoding error: {}", e)));
                     }
                 };
 
@@ -1186,51 +1216,51 @@ mod sasl {
                 let buf = self.sasl_response_body(server_nonce, &client_proof);
 
                 if let Err(e) = stream.write(&buf) {
-                    return Err(format!(
+                    return Err(AuthError(format!(
                         "Failed to write to stream for client SASL response: {}",
                         e
-                    ));
+                    )));
                 }
                 Ok(())
             } else {
-                return Err(format!("Failed to parse response data: {:?}", resp_str));
+                return Err(AuthError(format!("Failed to parse response data: {:?}", resp_str)));
             }
         }
 
-        fn handle_sasl_auth_ok(&self, stream: &mut TcpStream) -> Result<(), String> {
+        fn handle_sasl_auth_ok(&self, stream: &mut TcpStream) -> Result<(), AuthError> {
             let mut buf = [0; BUF_LEN];
             match stream.read(&mut buf) {
                 Ok(size) => {
                     let mut response = &buf[..size];
                     if response[0] != b'R' {
-                        return Err(format!(
+                        return Err(AuthError(format!(
                             "Invalid response in AuthenticationSASLFinal message: {:?}",
                             response[0]
-                        ));
+                        )));
                     }
 
                     let msg_len: i32 = (&buf[1..5]).get_i32();
                     let mut complete_tag = (&buf[5..9]).get_i32();
                     if complete_tag != 12 {
                         // 12 signifies SASL authentication has completed(AuthenticationSASLFinal)
-                        return Err(format!("Authentication incomplete: {}", complete_tag));
+                        return Err(AuthError(format!("Authentication incomplete: {}", complete_tag)));
                     }
 
                     response = &buf[msg_len as usize + 1..size];
                     if response[0] != b'R' {
-                        return Err(format!(
+                        return Err(AuthError(format!(
                             "Invalid response in AuthenticationOk message: {:?}",
                             response[0]
-                        ));
+                        )));
                     }
 
                     complete_tag = (&response[5..9]).get_i32();
                     if complete_tag != 0 {
                         // 0 signifies SASL authentication was successful(AuthenticationOk )
-                        return Err(format!("Authentication incomplete: {}", complete_tag));
+                        return Err(AuthError(format!("Authentication incomplete: {}", complete_tag)));
                     }
                 }
-                Err(e) => return Err(format!("Final Authentication Error: {}", e)),
+                Err(e) => return Err(AuthError(format!("Final Authentication Error: {}", e))),
             }
             Ok(())
         }
@@ -1239,17 +1269,17 @@ mod sasl {
             &self,
             stream: &mut TcpStream,
             auth_type: &[u8],
-        ) -> Result<(), String> {
+        ) -> Result<(), AuthError> {
             let pass =
                 normalize_password(&self.retrieve_password().expect("Could not decode password"));
 
             let buf = self.initial_response_body(auth_type, &self.user, &self.nonce);
 
             if let Err(e) = stream.write(&buf) {
-                return Err(format!(
+                return Err(AuthError(format!(
                     "Failed to write to stream for initial response: {}",
                     e
-                ));
+                )));
             }
 
             {
@@ -1265,34 +1295,34 @@ mod sasl {
 
                             if let Err(e) = self.send_client_sasl_response(&pass, stream, resp_data)
                             {
-                                return Err(format!("Error handling client SASL response: {}", e));
+                                return Err(AuthError(format!("Error handling client SASL response: {}", e)));
                             }
                         } else {
-                            return Err(format!("Unexpected message type: {}", response[0]));
+                            return Err(AuthError(format!("Unexpected message type: {}", response[0])));
                         }
                     }
                     Err(e) => {
-                        return Err(format!(
+                        return Err(AuthError(format!(
                             "Failed to read from stream for initial response: {}",
                             e
-                        ));
+                        )));
                     }
                 }
             }
             Ok(())
         }
 
-        pub fn authenticate(&self, stream: &mut TcpStream, _read_buf: &[u8]) -> Result<(), String> {
+        pub fn authenticate(&self, stream: &mut TcpStream, _read_buf: &[u8]) -> Result<(), AuthError> {
             let auth_type_text: &[u8] = b"SCRAM-SHA-256";
             match self.handle_sasl_authentication(stream, &auth_type_text) {
                 Ok(_) => {
                     if let Err(e) = self.handle_sasl_auth_ok(stream) {
-                        return Err(format!("Final Auth: {}", e));
+                        return Err(AuthError(format!("Final Auth: {}", e)));
                     }
                     Ok(())
                 }
                 Err(e) => {
-                    return Err(format!("Error handling SASL authentication: {}", e));
+                    return Err(AuthError(format!("Error handling SASL authentication: {}", e)));
                 }
             }
         }
