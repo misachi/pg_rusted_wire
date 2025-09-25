@@ -1,17 +1,36 @@
 /// WIP: PostgreSQL logical replication client implementation
+/// Run: lrepl -u prom_pg_exporter -P prom_pg_exporter -H 172.17.0.1 -d postgres -p 5432 --table <name>
+/// Help: lrepl -h
 use bytes::{BufMut, BytesMut};
 use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
+use clap::Parser;
 
 use pg_rusted_wire::wire::*;
 
 const DEFAULT_USER: &str = "postgres";
 const DEFAULT_PORT: u16 = 5432;
 const DEFAULT_IP: &str = "127.0.0.1";
-const DEFAULT_PASS: &str = "pass12234";
+// const DEFAULT_PASS: &str = "pass12234";
 
 const DEFAULT_DATABASE: &str = "postgres";
+
+#[derive(Debug, Parser)]
+struct RustedCli {
+    #[arg(short = 'u', long, default_value_t = DEFAULT_USER.to_string())]
+    user: String,
+    #[arg(short = 'p', long, default_value_t = DEFAULT_PORT)]
+    port: u16,
+    #[arg(short = 'H', long, default_value_t = DEFAULT_IP.to_string())]
+    host: String,
+    #[arg(short = 'P', long)]
+    password: String,
+    #[arg(short = 'd', long, default_value_t = DEFAULT_DATABASE.to_string())]
+    database: String,
+    #[arg(short, long)]
+    table: String
+}
 
 fn process_simple(
     stream: &mut std::net::TcpStream,
@@ -38,16 +57,18 @@ fn process_simple(
 }
 
 fn main() {
+    let args = RustedCli::parse();
+
     let mut startup_msg = StartupMsg::new(
-        String::from(DEFAULT_USER),
-        Some(String::from(DEFAULT_DATABASE)),
+        String::from(args.user),
+        Some(String::from(args.database)),
         None,
         Some(String::from("database")),
     );
 
     let client = Client::new(
-        Ipv4Addr::from_str(DEFAULT_IP).expect("IPV4 address error"),
-        DEFAULT_PORT,
+        Ipv4Addr::from_str(&args.host).expect("IPV4 address error"),
+        args.port,
     );
     let mut state = QueryState {
         overflowed: false,
@@ -58,7 +79,7 @@ fn main() {
 
     match client.connect() {
         Ok(mut stream) => {
-            if let Err(e) = client.authenticate(&mut stream, &mut startup_msg, DEFAULT_PASS) {
+            if let Err(e) = client.authenticate(&mut stream, &mut startup_msg, &args.password) {
                 eprintln!("Client Authentication: {}", e);
                 return;
             }

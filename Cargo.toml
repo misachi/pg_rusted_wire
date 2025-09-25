@@ -15,6 +15,7 @@ stringprep = "0.1.5"
 md-5 = "0.10.6"
 hex = "0.4"
 chrono = "0.4"
+clap = { version = "4.5.48", features = ["derive"] }
 
 [lib]
 name = "pg_rusted_wire"
