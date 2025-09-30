@@ -14,7 +14,6 @@ const DEFAULT_PASS: &str = "pass12234";
 
 const DEFAULT_DATABASE: &str = "postgres";
 
-
 fn main() {
     let mut startup_msg = StartupMsg::new(
         String::from(DEFAULT_USER),
@@ -27,12 +26,7 @@ fn main() {
         Ipv4Addr::from_str(DEFAULT_IP).expect("IPV4 address error"),
         DEFAULT_PORT,
     );
-    let mut state = QueryState {
-        overflowed: false,
-        skip_bytes: 0,
-        overflow_buf: BytesMut::new(),
-        data_buf_off: 0,
-    };
+    let mut state = QueryState::default();
 
     match client.connect() {
         Ok(mut stream) => {
@@ -43,7 +37,7 @@ fn main() {
 
             println!("Client connection\nUse Ctrl+c or type \"exit\" to end\n");
 
-            let mut result_buf = [0;4096];
+            let mut result_buf = [0; 4096];
             let mut row_descr = BytesMut::new();
 
             loop {
@@ -75,9 +69,16 @@ fn main() {
 
                 let buf_is_cleared = false;
                 loop {
-                    stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap(); // Set a timeout to avoid blocking indefinitely
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(100)))
+                        .unwrap(); // Set a timeout to avoid blocking indefinitely
                     state.data_buf_off = 0;
-                    match process_simple_query(&mut stream, &mut result_buf, &mut row_descr, &mut state) {
+                    match process_simple_query(
+                        &mut stream,
+                        &mut result_buf,
+                        &mut row_descr,
+                        &mut state,
+                    ) {
                         Ok(done) => {
                             if done {
                                 row_descr.put_u8(b'\n');
@@ -113,7 +114,6 @@ fn main() {
                         // Clear only once
                         row_descr.clear();
                     }
-
                 }
             }
         }
