@@ -105,3 +105,12 @@ id|k
 
 psql>
 ```
+
+# Logical Replication Support
+To use logical replication use the example command below
+```
+cargo run --example lrepl -- -u <user> -P <password> -H <host> -d <database> -p <port> --table <name> --publication <pub1> --config-dir <dir>
+```
+Fill in the <> brackets with valid values for the flags. Use `cargo run --example lrepl -- -h` for details on the required flags and the available defaults.
+
+Currently, you can stream changes to a local file on your system inside the `--config-dir` directory that you provided above. With the commnad, a snapshot of the table is first copied to the file named `<table_name.data>`. Later, DML changes streamed from PG are appended to the file. Only INSERT operation is supported at the moment. UPDATE and DELETE may be added at a later time. You can only replicate one table at a time.
