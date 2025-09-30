@@ -2,12 +2,22 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::{Buf, BufMut, BytesMut};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json;
+use std::collections::HashMap;
 use std::fmt::{self, Debug};
-use std::io::{Read, Write, stdout};
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::io::{Read, Seek, Write, stdout};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::path::Path;
+use std::{thread, time};
 
 const BUF_LEN: usize = 1024; // Buffer size for reading from the stream
-const PROTOCOL_VERSION: i32 = 196608; // 3.0.0 in PostgreSQL protocol versioning
+pub const PROTOCOL_VERSION: i32 = 196608; // 3.0.0 in PostgreSQL protocol versioning
+const REPLICATION_META_FILE: &str = "meta.json";
+const REPLICATION_DATA_FILE_EXT: &str = ".data";
+const WAIT_OFF_CPU: u64 = 50; // In milliseconds
 
 #[derive(Debug)]
 pub struct SimpleQueryError(pub String);
@@ -27,7 +37,16 @@ impl fmt::Display for AuthError {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
+pub struct ReplicationError(pub String);
+
+impl fmt::Display for ReplicationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Replication: {}", self.0)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct TableInfo {
     name: String,
     oid: i32,
@@ -35,7 +54,454 @@ struct TableInfo {
     ncols: i16,        // Number of columns
     cols: Vec<String>, // Column names
     slot: String,      // Slot name
+    publication: String,
+    snapshot_done: bool,
+    out_resource: FileOutResource,
+}
+
+impl TableInfo {
+    fn new(config_dir: &str, name: &str) -> Self {
+        let data_path = format!("{}/{}{}", config_dir, name, REPLICATION_DATA_FILE_EXT);
+
+        Self {
+            name: name.to_string(),
+            slot: format!("{}_slot", name),
+            out_resource: FileOutResource::new(&data_path),
+            ..Default::default()
+        }
+    }
+}
+
+pub trait OutResource {
+    fn write(&self, data: &[u8]) -> io::Result<()>;
+    fn read(&self, data: &mut [u8], pos: u64) -> io::Result<usize>;
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct FileOutResource {
     path: String,
+}
+
+impl FileOutResource {
+    fn new(path: &str) -> Self {
+        Self {
+            path: Path::new(path).to_string_lossy().to_string(),
+        }
+    }
+}
+
+impl OutResource for FileOutResource {
+    fn write(&self, data: &[u8]) -> io::Result<()> {
+        let path = Path::new(&self.path);
+
+        let mut handle = OpenOptions::new().append(true).create(true).open(path)?;
+
+        handle.write_all(data)?;
+        handle.sync_all()?; // Flush to disk immediately
+
+        Ok(())
+    }
+
+    fn read(&self, data: &mut [u8], pos: u64) -> io::Result<usize> {
+        let mut handle = File::open(&self.path)?;
+        let _ = handle.seek(io::SeekFrom::Start(pos));
+        return handle.read(data);
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ReplicationInfo {
+    sys_id: String,
+    timeline: u8,
+    start_lsn: String,
+    table: HashMap<String, TableInfo>,
+    meta_file_path: String,
+}
+
+impl ReplicationInfo {
+    fn new(config_dir: &str) -> Self {
+        Self {
+            meta_file_path: format!("{}/{}", config_dir, REPLICATION_META_FILE),
+            ..Default::default()
+        }
+    }
+
+    fn encode(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    fn decode(&self, data: &str) -> Result<ReplicationInfo, ReplicationError> {
+        let info: ReplicationInfo = serde_json::from_str(data).expect("Error decoding from json");
+        Ok(info)
+    }
+
+    fn path_exists(path: &str) -> bool {
+        Path::new(&path).exists()
+    }
+
+    fn load(&self) -> io::Result<ReplicationInfo> {
+        if !ReplicationInfo::path_exists(&self.meta_file_path) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Info Path does not exist",
+            ));
+        }
+        let path = Path::new(&self.meta_file_path);
+        let mut buf = vec![];
+        let mut handle = File::open(path)?;
+
+        handle.read_to_end(&mut buf)?;
+
+        match self.decode(&String::from_utf8_lossy(&buf)) {
+            Ok(data) => Ok(data),
+            Err(e) => {
+                eprintln!("ReplicationInfo: {}", e);
+                Err(io::Error::new(io::ErrorKind::Other, e.0))
+            }
+        }
+    }
+
+    fn dump(&self) -> io::Result<()> {
+        let path = Path::new(&self.meta_file_path);
+        let mut buf = [0; BUF_LEN];
+
+        let mut handle = File::create(path)?;
+
+        match self.encode() {
+            Ok(serialized_data) => {
+                buf[..serialized_data.as_bytes().len()].copy_from_slice(serialized_data.as_bytes());
+                handle.write_all(&buf[..serialized_data.as_bytes().len()])?;
+                handle.sync_all()?; // Flush to disk immediately
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Replication {
+    info: ReplicationInfo,
+    config_dir: Option<String>,
+}
+
+impl Replication {
+    pub fn new(config_dir: &str) -> Self {
+        let repl_info = ReplicationInfo::new(config_dir);
+        match repl_info.load() {
+            Ok(info) => Self {
+                info: info,
+                config_dir: Some(config_dir.to_string()),
+            },
+            Err(_) => Self {
+                info: repl_info,
+                config_dir: Some(config_dir.to_string()),
+            },
+        }
+    }
+
+    fn snapshot_taken(&self, table: &str) -> bool {
+        if let Some(info) = self.info.table.get(table) {
+            return info.snapshot_done;
+        }
+        false
+    }
+
+    fn system_valid(&self, sys_id: &str) -> bool {
+        self.info.sys_id == sys_id
+    }
+
+    fn check_slot_exists(
+        &mut self,
+        stream: &mut std::net::TcpStream,
+        table: &str,
+    ) -> Result<bool, ReplicationError> {
+        let mut result_buf = [0; BUF_LEN];
+        let mut row_descr = BytesMut::new();
+
+        let mut state = QueryState::default();
+        let table_info: &TableInfo;
+
+        if let Some(info) = self.info.table.get(table) {
+            table_info = info;
+        } else {
+            return Err(ReplicationError(format!("Table does not exist")));
+        }
+
+        let msg = String::from(format!(
+            "SELECT 1 FROM pg_replication_slots WHERE slot_name = '{}' AND slot_type = 'logical'",
+            table_info.slot
+        ));
+        if let Some(e) = send_simple_query(stream, &msg) {
+            return Err(ReplicationError(format!(
+                "Check Replication Slot Query Error: {}",
+                e
+            )));
+        }
+
+        if let Err(e) = process_simple(stream, &mut state, &mut result_buf, &mut row_descr, self) {
+            return Err(ReplicationError(format!(
+                "Check Replication Slot Exists: {}",
+                e
+            )));
+        }
+
+        if state.data_buf_off > 0 {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn identify(&mut self, stream: &mut std::net::TcpStream) -> Result<(), ReplicationError> {
+        let mut result_buf = [0; BUF_LEN];
+        let mut row_descr = BytesMut::new();
+
+        let mut state = QueryState::default();
+
+        let msg = String::from("IDENTIFY_SYSTEM");
+
+        if let Some(e) = send_simple_query(stream, &msg) {
+            return Err(ReplicationError(format!("Identify Query Error: {}", e)));
+        }
+        if let Err(e) = process_simple(stream, &mut state, &mut result_buf, &mut row_descr, self) {
+            return Err(ReplicationError(format!("IDENTIFY SYSTEM Error: {}", e)));
+        }
+        let parts: Vec<&[u8]> = result_buf.split(|&b| b == b'|').collect();
+
+        let sys_id = String::from_utf8_lossy(&parts[0]).to_string();
+        if !self.system_valid(&sys_id) && self.info.sys_id.len() > 0 {
+            return Err(ReplicationError(format!("Invalid System ID")));
+        }
+
+        println!("{}", String::from_utf8_lossy(parts[1]));
+
+        let timeline = String::from_utf8_lossy(parts[1]);
+        //: [u8; 1] = parts[1].try_into().unwrap();
+
+        // println!("{}", String::from_utf8_lossy(&timeline));
+
+        self.info.sys_id = sys_id;
+        self.info.timeline = timeline.parse().unwrap();
+        //= u8::from_le_bytes(timeline);
+        self.info.start_lsn = String::from_utf8_lossy(&parts[2]).to_string();
+
+        if let Err(e) = self.info.dump() {
+            return Err(ReplicationError(format!("Error saving state: {}", e)));
+        }
+        Ok(())
+    }
+
+    fn create_slot(
+        &mut self,
+        stream: &mut std::net::TcpStream,
+        table: &str,
+        publication: &str,
+    ) -> Result<(), ReplicationError> {
+        let mut result_buf = [0; BUF_LEN];
+        let mut row_descr = BytesMut::new();
+
+        let mut state = QueryState::default();
+        let table_info: &TableInfo;
+
+        if let Some(info) = self.info.table.get(table) {
+            table_info = info;
+        } else {
+            let mut info = TableInfo::new(&self.config_dir.clone().unwrap(), table);
+            info.publication = publication.to_string();
+            self.info.table.insert(table.to_string(), info);
+            self.info.dump().expect("Unable to save table details");
+            table_info = self
+                .info
+                .table
+                .get(table)
+                .expect("Error creating new table");
+        }
+
+        let msg = String::from(format!(
+            "CREATE_REPLICATION_SLOT {} LOGICAL pgoutput",
+            table_info.slot
+        ));
+
+        if let Err(e) = self.identify(stream) {
+            return Err(ReplicationError(format!("System Identity: {}", e)));
+        }
+
+        match self.check_slot_exists(stream, table) {
+            Ok(b) => {
+                if b {
+                    return Ok(());
+                }
+            }
+            Err(e) => return Err(ReplicationError(format!("Check slot: {}", e))),
+        }
+
+        if let Some(e) = send_simple_query(stream, &msg) {
+            return Err(ReplicationError(format!("Create Slot Query Error: {}", e)));
+        }
+        if let Err(e) = process_simple(stream, &mut state, &mut result_buf, &mut row_descr, self) {
+            return Err(ReplicationError(format!(
+                "Replication Slot Create Error: {}",
+                e
+            )));
+        }
+
+        // Check for query results here
+        Ok(())
+    }
+
+    fn copy_snapshot(
+        &mut self,
+        stream: &mut std::net::TcpStream,
+        table: &str,
+    ) -> Result<(), ReplicationError> {
+        let mut result_buf = [0; 4096];
+        let mut row_descr = BytesMut::new();
+
+        let mut state = QueryState::default();
+        let msg = String::from(format!("COPY {} TO STDOUT", table));
+
+        if let Some(e) = send_simple_query(stream, &msg) {
+            return Err(ReplicationError(format!("Copy Error: {}", e)));
+        }
+
+        loop {
+            match process_simple(stream, &mut state, &mut result_buf, &mut row_descr, self) {
+                Ok(SimpleQueryCompletion::CommandComplete) => break,
+                Ok(SimpleQueryCompletion::CopyComplete) => {
+                    let table_info: &mut TableInfo;
+                    if let Some(info) = self.info.table.get_mut(table) {
+                        table_info = info;
+                    } else {
+                        return Err(ReplicationError(format!("Table does not exist")));
+                    }
+
+                    let out_res = table_info.out_resource.clone();
+
+                    table_info.snapshot_done = true;
+                    self.info.dump().expect("Error saving state");
+
+                    self.write_to(&out_res, &result_buf, &state);
+                    break;
+                }
+                Ok(SimpleQueryCompletion::InProgress) => {
+                    let table_info: &mut TableInfo;
+                    if let Some(info) = self.info.table.get_mut(table) {
+                        table_info = info;
+                    } else {
+                        return Err(ReplicationError(format!("Table does not exist")));
+                    }
+
+                    let out_res = table_info.out_resource.clone();
+
+                    self.write_to(&out_res, &result_buf, &state);
+                }
+                Ok(SimpleQueryCompletion::InProgressReadStream) => {
+                    let table_info: &mut TableInfo;
+                    if let Some(info) = self.info.table.get_mut(table) {
+                        table_info = info;
+                    } else {
+                        return Err(ReplicationError(format!("Table does not exist")));
+                    }
+
+                    let out_res = table_info.out_resource.clone();
+
+                    self.write_to(&out_res, &result_buf, &state);
+                }
+                Ok(SimpleQueryCompletion::CommandError) => {
+                    break;
+                }
+                Ok(SimpleQueryCompletion::CopyError) => {
+                    break;
+                }
+                Err(e) => {
+                    return Err(ReplicationError(format!(
+                        "Error processing simple query: {}",
+                        e
+                    )));
+                }
+                _ => (),
+            }
+
+            result_buf.fill(0);
+            row_descr.clear();
+        }
+        Ok(())
+    }
+
+    fn write_to(&mut self, out_res: &FileOutResource, result_buf: &[u8], state: &QueryState) {
+        let mut off = state.data_buf_off;
+        if off <= 0 {
+            off = state.recycle_buf_off;
+        }
+        if let Err(e) = out_res.write(&result_buf[..off]) {
+            eprintln!("Error when writing to stdout for DataRow: {}", e);
+        }
+    }
+
+    fn start(
+        &mut self,
+        stream: &mut std::net::TcpStream,
+        table: &str,
+    ) -> Result<(), ReplicationError> {
+        let mut result_buf = [0; 4096];
+        let mut row_descr = BytesMut::new();
+
+        let mut state = QueryState::default();
+        let table_info: &TableInfo;
+
+        if let Some(info) = self.info.table.get(table) {
+            table_info = info;
+        } else {
+            return Err(ReplicationError(format!("Table does not exist")));
+        }
+        let out_res = table_info.out_resource.clone();
+
+        let msg = String::from(format!(
+            "START_REPLICATION SLOT {} LOGICAL {} (proto_version '4', publication_names '{}')",
+            table_info.slot, self.info.start_lsn, table_info.publication
+        ));
+
+        if let Some(e) = send_simple_query(stream, &msg) {
+            return Err(ReplicationError(format!(
+                "START REPLICATION Command Error: {}",
+                e
+            )));
+        }
+
+        loop {
+            match process_simple(stream, &mut state, &mut result_buf, &mut row_descr, self) {
+                Ok(SimpleQueryCompletion::CommandComplete) => break,
+                Ok(SimpleQueryCompletion::CopyComplete) => {
+                    self.write_to(&out_res, &result_buf, &state)
+                }
+                Ok(SimpleQueryCompletion::InProgress) => {
+                    self.write_to(&out_res, &result_buf, &state)
+                }
+                Ok(SimpleQueryCompletion::InProgressReadStream) => {
+                    self.write_to(&out_res, &result_buf, &state)
+                }
+                Ok(SimpleQueryCompletion::CommandError) => {
+                    break;
+                }
+                Ok(SimpleQueryCompletion::CopyError) => {
+                    break;
+                }
+                Err(e) => {
+                    return Err(ReplicationError(format!(
+                        "Error processing simple query: {}",
+                        e
+                    )));
+                }
+                _ => (),
+            }
+
+            result_buf.fill(0);
+            row_descr.clear();
+
+            thread::sleep(time::Duration::from_millis(WAIT_OFF_CPU));
+        }
+        Ok(())
+    }
 }
 
 pub struct QueryState {
@@ -43,9 +509,22 @@ pub struct QueryState {
     pub skip_bytes: u32,
     pub overflow_buf: BytesMut,
     pub data_buf_off: usize,
+    recycle_buf_off: usize,
 }
 
-#[derive(Debug)]
+impl Default for QueryState {
+    fn default() -> Self {
+        Self {
+            overflowed: false,
+            skip_bytes: 0,
+            overflow_buf: BytesMut::with_capacity(BUF_LEN),
+            data_buf_off: 0,
+            recycle_buf_off: 0,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct StartupMsg {
     protocol: i32,
     user: String,
@@ -58,15 +537,17 @@ pub struct StartupMsg {
 pub struct Client {
     addr: Ipv4Addr,
     port: u16,
-    // stream: Option<TcpStream>,
+    replication: Option<Replication>,
+    startup: StartupMsg,
 }
 
 impl Client {
     pub fn new(addr: Ipv4Addr, port: u16) -> Self {
-        Client {
+        Self {
             addr: addr,
             port: port,
-            // stream: None,
+            startup: StartupMsg::default(),
+            replication: None,
         }
     }
 
@@ -79,6 +560,97 @@ impl Client {
         }
     }
 
+    pub fn with_database(mut self, db: &str) -> Self {
+        self.startup.database = Some(db.to_string());
+        self
+    }
+
+    pub fn with_user(mut self, user: &str) -> Self {
+        self.startup.user = user.to_string();
+        self
+    }
+
+    pub fn with_replication(mut self, repl: &str) -> Self {
+        self.startup.replication = Some(repl.to_string());
+        self
+    }
+
+    pub fn with_protocol(mut self, prot: i32) -> Self {
+        self.startup.protocol = prot;
+        self
+    }
+
+    pub fn with_config_dir(mut self, config_dir: &str) -> Self {
+        self.replication = Some(Replication::new(config_dir));
+        self
+    }
+
+    pub fn authenticate2(
+        &mut self,
+        stream: &mut TcpStream,
+        // startup_msg: &mut StartupMsg,
+        pass: &str,
+    ) -> Result<(), AuthError> {
+        let msg_bytes = self.startup.to_bytes();
+        let mut buf = [0; BUF_LEN]; // Buffer to read response
+
+        if let Err(e) = stream.write(&msg_bytes) {
+            return Err(AuthError(format!("Failed to write to stream: {}", e)));
+        }
+
+        loop {
+            match stream.read(&mut buf) {
+                Ok(size) => {
+                    if size <= 0 {
+                        return Err(AuthError(format!("Server closed the connection")));
+                    }
+
+                    if size > BUF_LEN {
+                        return Err(AuthError(format!("Received data exceeds buffer size")));
+                    }
+                    let response = &buf[..size];
+
+                    match response[0] {
+                        b'R' => {
+                            // 'R' for Authentication
+                            let auth_type_num = (&buf[5..9]).get_i32();
+
+                            match get_auth_type(auth_type_num) {
+                                AuthenticationType::CleartextPassword => {
+                                    let auth =
+                                        textpassword::ClearTextPass::new(&pass, &self.startup.user);
+                                    auth.authenticate(stream, &buf)?;
+                                    break;
+                                }
+                                AuthenticationType::MD5Password => {
+                                    let auth = md5password::MD5Pass::new(&pass, &self.startup.user);
+                                    auth.authenticate(stream, &buf)?;
+                                    break;
+                                }
+                                AuthenticationType::SASL => {
+                                    let auth = sasl::SASL::new(&pass, &self.startup.user);
+                                    auth.authenticate(stream, &buf)?;
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(AuthError(format!(
+                                "Unexpected message type: {}",
+                                response[0]
+                            )));
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(AuthError(format!("Failed to read from stream: {}", e)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // To be deleted once examples using it are updated
     pub fn authenticate(
         &self,
         stream: &mut TcpStream,
@@ -129,7 +701,10 @@ impl Client {
                             }
                         }
                         _ => {
-                            return Err(AuthError(format!("Unexpected message type: {}", response[0])));
+                            return Err(AuthError(format!(
+                                "Unexpected message type: {}",
+                                response[0]
+                            )));
                         }
                     }
                 }
@@ -139,6 +714,20 @@ impl Client {
             }
         }
         Ok(())
+    }
+
+    pub fn run(&mut self, stream: &mut std::net::TcpStream, table: &str, publication_name: &str) {
+        let replication = self.replication.as_mut().expect("Replication must be set");
+
+        replication
+            .create_slot(stream, table, publication_name)
+            .unwrap();
+
+        if !replication.snapshot_taken(table) {
+            replication.copy_snapshot(stream, table).unwrap()
+        }
+
+        replication.start(stream, table).unwrap()
     }
 }
 
@@ -669,11 +1258,68 @@ pub fn process_simple_query(
     Ok(is_done)
 }
 
-pub fn process_logical_repl(
+fn handle_overflowed(
+    data_buf: &mut [u8],
+    state: &mut QueryState,
+    buf: &[u8],
+    size: &mut usize,
+    off: &mut usize,
+    cpy_size: usize,
+) {
+    // What??
+    state.overflow_buf.put_slice(&buf[..cpy_size]);
+    let msg_len: i32 = (&state.overflow_buf[1..5]).get_i32();
+    state.skip_bytes = (msg_len + 1) as u32 - state.skip_bytes;
+
+    *size = if *size >= (state.skip_bytes as usize) {
+        *size - state.skip_bytes as usize
+    } else {
+        0
+    };
+    *off += state.skip_bytes as usize;
+
+    // Account for byte, 4 byte for content size
+    let val_off = 5;
+
+    //TODO: CLean this up. Not looking good
+    let mut buf = BytesMut::with_capacity(state.overflow_buf.len());
+    buf.put_slice(&state.overflow_buf);
+
+    let data: &[u8];
+    if msg_len as usize + 1 < buf.len() {
+        data = &buf[val_off..msg_len as usize + 1];
+    } else {
+        data = &buf[val_off..];
+    }
+    data_buf[state.data_buf_off..state.data_buf_off + data.len()].copy_from_slice(data);
+    state.data_buf_off += data.len();
+
+    state.overflow_buf.clear();
+    state.overflowed = false;
+    state.skip_bytes = 0;
+}
+
+fn process_simple(
+    stream: &mut std::net::TcpStream,
+    state: &mut QueryState,
+    result_buf: &mut [u8],
+    row_descr: &mut BytesMut,
+    replication: &mut Replication,
+) -> Result<SimpleQueryCompletion, SimpleQueryError> {
+    // stream.set_read_timeout(Some(Duration::from_millis(1000))).unwrap(); // Set a timeout to avoid blocking indefinitely
+    state.data_buf_off = 0;
+
+    let ret = process_logical_repl(stream, result_buf, row_descr, state, replication);
+
+    ret
+}
+
+fn process_logical_repl(
     stream: &mut TcpStream,
     data_buf: &mut [u8],
     row_descr: &mut BytesMut,
     state: &mut QueryState,
+    replication: &mut Replication,
 ) -> Result<SimpleQueryCompletion, SimpleQueryError> {
     let mut buf = [0; BUF_LEN]; // Buffer to read response
     let mut buf_off = 0;
@@ -691,7 +1337,8 @@ pub fn process_logical_repl(
         match stream.read(&mut buf[buf_off..]) {
             Ok(r_size) => {
                 if r_size <= 0 {
-                    return Err(SimpleQueryError("Server closed the connection".to_string()));
+                    is_done = SimpleQueryCompletion::NoMatch;
+                    break;
                 }
 
                 if r_size > BUF_LEN {
@@ -771,6 +1418,12 @@ pub fn process_logical_repl(
                         }
                         b'd' => {
                             // 'd' for CopyData
+                            if state.skip_bytes > 0 {
+                                handle_overflowed(
+                                    data_buf, state, &buf, &mut size, &mut off, cpy_size,
+                                );
+                                continue;
+                            }
                             if off + 5 > cpy_size {
                                 state.overflowed = true;
                                 state.overflow_buf.clear();
@@ -785,6 +1438,7 @@ pub fn process_logical_repl(
                                 state.overflow_buf.clear();
                                 state.overflow_buf.put_slice(&buf[off..cpy_size]);
                                 state.skip_bytes = buf[off..cpy_size].len() as u32;
+                                state.recycle_buf_off = state.data_buf_off;
                                 state.data_buf_off = 0; // Reset offset
                                 return Ok(is_done);
                             }
@@ -832,6 +1486,7 @@ pub fn process_logical_repl(
                                 }
                                 b'w' => {
                                     let xlog_data = &msg_data[25..];
+                                    // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html
                                     match xlog_data[0] {
                                         b'B' => {
                                             // BEGIN
@@ -839,22 +1494,90 @@ pub fn process_logical_repl(
                                         }
                                         b'I' => {
                                             // INSERT
-                                            let tuple_data = &xlog_data[10..];
-                                            println!(
-                                                "XLogData: {:?}",
-                                                String::from_utf8_lossy(tuple_data)
-                                            );
-                                            data_buf[state.data_buf_off
-                                                ..state.data_buf_off + tuple_data.len()]
-                                                .copy_from_slice(tuple_data);
-                                            state.data_buf_off += tuple_data.len();
+                                            let tuple_data = &xlog_data[6..];
+                                            let col_num: i16 = (&tuple_data[..2]).get_i16();
+
+                                            // Number of columns
+                                            let mut off = 2;
+                                            for k in 0..col_num {
+                                                // Submessage
+                                                off += 1;
+                                                let val_len = (&tuple_data[off..off + 4]).get_i32();
+                                                off += 4;
+
+                                                data_buf[state.data_buf_off
+                                                    ..state.data_buf_off + val_len as usize]
+                                                    .copy_from_slice(
+                                                        &tuple_data[off..off + val_len as usize],
+                                                    );
+                                                state.data_buf_off += val_len as usize;
+                                                off += val_len as usize;
+
+                                                if (k + 1) < col_num {
+                                                    data_buf[state.data_buf_off] = b'\t';
+                                                    state.data_buf_off += 1;
+                                                }
+                                            }
+                                            data_buf[state.data_buf_off] = b'\n';
+                                            state.data_buf_off += 1;
                                         }
                                         b'U' => { // UPDATE
                                         }
                                         b'D' => {
                                             // DELETE
                                         }
-                                        b'R' => { // RELATION
+                                        b'R' => {
+                                            // RELATION: https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-RELATION
+                                            // Assume non-streamed transactions, so TransactionId is ignored
+                                            let oid = (&xlog_data[1..5]).get_i32();
+                                            let parts: &Vec<&[u8]> =
+                                                &xlog_data[5..].split(|&b| b == b'\0').collect();
+                                            let namespace = parts[0];
+                                            let rel_name = parts[1];
+                                            // Adding 8 to account for the 2 c-string terminators
+                                            let mut off = namespace.len() + rel_name.len() + 8;
+                                            let num_cols = (&xlog_data[off..off + 2]).get_i16();
+                                            let table_info: &mut TableInfo;
+
+                                            if let Some(info) = replication.info.table.get_mut(
+                                                &String::from_utf8_lossy(rel_name).to_string(),
+                                            ) {
+                                                table_info = info;
+                                            } else {
+                                                return Err(SimpleQueryError(format!(
+                                                    "Table does not exist"
+                                                )));
+                                            }
+
+                                            table_info.name =
+                                                String::from_utf8_lossy(rel_name).to_string();
+                                            table_info.oid = oid;
+                                            table_info.namespace =
+                                                String::from_utf8_lossy(namespace).to_string();
+                                            table_info.ncols = num_cols;
+                                            table_info.cols.clear();
+
+                                            // Include column number
+                                            off += 2;
+                                            for _ in 0..num_cols {
+                                                // Ignore flags byte
+                                                off += 1;
+                                                let parts: &Vec<&[u8]> = &xlog_data[off..]
+                                                    .split(|&b| b == b'\0')
+                                                    .collect();
+                                                table_info.cols.push(
+                                                    String::from_utf8_lossy(parts[0]).to_string(),
+                                                );
+                                                // 2 ints for column oid and column type modifier and C-string terminator
+                                                off += 9 + parts[0].len();
+                                            }
+
+                                            if let Err(e) = replication.info.dump() {
+                                                return Err(SimpleQueryError(format!(
+                                                    "Saving relation data error: {}",
+                                                    e
+                                                )));
+                                            }
                                         }
                                         b'C' => {
                                             // COMMIT
@@ -871,8 +1594,8 @@ pub fn process_logical_repl(
                                 }
                             }
 
-                            size = if size >= (msg_len as usize) {
-                                size - msg_len as usize
+                            size = if size >= (msg_len as usize + 1) {
+                                size - (msg_len as usize + 1)
                             } else {
                                 0
                             };
@@ -884,37 +1607,10 @@ pub fn process_logical_repl(
                         }
                         _ => {
                             // Handle incomplete data in read buffer(Alot to improve here)
-                            if state.overflowed && state.skip_bytes > 0 {
-                                state.overflow_buf.put_slice(&buf[..cpy_size]); // What??
-                                let msg_len: i32 = (&state.overflow_buf[1..5]).get_i32();
-                                state.skip_bytes = (msg_len + 1) as u32 - state.skip_bytes;
-
-                                size = if size >= (state.skip_bytes as usize) {
-                                    size - state.skip_bytes as usize
-                                } else {
-                                    0
-                                };
-                                off += state.skip_bytes as usize;
-
-                                let val_off = 5; // Account for byte, 4 byte for content size
-
-                                //TODO: CLean this up. Not looking good
-                                let mut buf = BytesMut::with_capacity(state.overflow_buf.len());
-                                buf.put_slice(&state.overflow_buf);
-
-                                let data: &[u8];
-                                if msg_len as usize + 1 < buf.len() {
-                                    data = &buf[val_off..msg_len as usize + 1];
-                                } else {
-                                    data = &buf[val_off..];
-                                }
-                                data_buf[state.data_buf_off..state.data_buf_off + data.len()]
-                                    .copy_from_slice(data);
-                                state.data_buf_off += data.len();
-
-                                state.overflow_buf.clear();
-                                state.overflowed = false;
-                                state.skip_bytes = 0;
+                            if state.overflowed {
+                                handle_overflowed(
+                                    data_buf, state, &buf, &mut size, &mut off, cpy_size,
+                                );
                             } else {
                                 let msg_len: i32 = (&buf[1..5]).get_i32();
                                 eprintln!(
@@ -943,7 +1639,7 @@ mod md5password {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    use crate::wire::{BUF_LEN, add_buf_len, decoded_password, encode_password, AuthError};
+    use crate::wire::{AuthError, BUF_LEN, add_buf_len, decoded_password, encode_password};
 
     #[derive(Debug)]
     pub struct MD5Pass {
@@ -991,7 +1687,11 @@ mod md5password {
             ret_vec
         }
 
-        pub fn authenticate(&self, stream: &mut TcpStream, _read_buf: &[u8]) -> Result<(), AuthError> {
+        pub fn authenticate(
+            &self,
+            stream: &mut TcpStream,
+            _read_buf: &[u8],
+        ) -> Result<(), AuthError> {
             let mut buf = BytesMut::with_capacity(BUF_LEN);
             buf.put_u8(b'p'); // identify message as PasswordMessage
 
@@ -1046,7 +1746,7 @@ mod textpassword {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    use crate::wire::{BUF_LEN, add_buf_len, decoded_password, encode_password, AuthError};
+    use crate::wire::{AuthError, BUF_LEN, add_buf_len, decoded_password, encode_password};
 
     #[derive(Debug)]
     pub struct ClearTextPass {
@@ -1060,7 +1760,11 @@ mod textpassword {
             }
         }
 
-        pub fn authenticate(&self, stream: &mut TcpStream, _read_buf: &[u8]) -> Result<(), AuthError> {
+        pub fn authenticate(
+            &self,
+            stream: &mut TcpStream,
+            _read_buf: &[u8],
+        ) -> Result<(), AuthError> {
             let mut buf = BytesMut::with_capacity(BUF_LEN);
             buf.put_u8(b'p'); // identify message as PasswordMessage
 
@@ -1125,7 +1829,7 @@ mod sasl {
     use std::net::TcpStream;
     use std::ops::BitXor;
 
-    use crate::wire::{BUF_LEN, add_buf_len, decoded_password, encode_password, AuthError};
+    use crate::wire::{AuthError, BUF_LEN, add_buf_len, decoded_password, encode_password};
 
     #[derive(Debug)]
     pub struct SASL {
@@ -1223,7 +1927,10 @@ mod sasl {
                 }
                 Ok(())
             } else {
-                return Err(AuthError(format!("Failed to parse response data: {:?}", resp_str)));
+                return Err(AuthError(format!(
+                    "Failed to parse response data: {:?}",
+                    resp_str
+                )));
             }
         }
 
@@ -1243,7 +1950,10 @@ mod sasl {
                     let mut complete_tag = (&buf[5..9]).get_i32();
                     if complete_tag != 12 {
                         // 12 signifies SASL authentication has completed(AuthenticationSASLFinal)
-                        return Err(AuthError(format!("Authentication incomplete: {}", complete_tag)));
+                        return Err(AuthError(format!(
+                            "Authentication incomplete: {}",
+                            complete_tag
+                        )));
                     }
 
                     response = &buf[msg_len as usize + 1..size];
@@ -1257,7 +1967,10 @@ mod sasl {
                     complete_tag = (&response[5..9]).get_i32();
                     if complete_tag != 0 {
                         // 0 signifies SASL authentication was successful(AuthenticationOk )
-                        return Err(AuthError(format!("Authentication incomplete: {}", complete_tag)));
+                        return Err(AuthError(format!(
+                            "Authentication incomplete: {}",
+                            complete_tag
+                        )));
                     }
                 }
                 Err(e) => return Err(AuthError(format!("Final Authentication Error: {}", e))),
@@ -1295,10 +2008,16 @@ mod sasl {
 
                             if let Err(e) = self.send_client_sasl_response(&pass, stream, resp_data)
                             {
-                                return Err(AuthError(format!("Error handling client SASL response: {}", e)));
+                                return Err(AuthError(format!(
+                                    "Error handling client SASL response: {}",
+                                    e
+                                )));
                             }
                         } else {
-                            return Err(AuthError(format!("Unexpected message type: {}", response[0])));
+                            return Err(AuthError(format!(
+                                "Unexpected message type: {}",
+                                response[0]
+                            )));
                         }
                     }
                     Err(e) => {
@@ -1312,7 +2031,11 @@ mod sasl {
             Ok(())
         }
 
-        pub fn authenticate(&self, stream: &mut TcpStream, _read_buf: &[u8]) -> Result<(), AuthError> {
+        pub fn authenticate(
+            &self,
+            stream: &mut TcpStream,
+            _read_buf: &[u8],
+        ) -> Result<(), AuthError> {
             let auth_type_text: &[u8] = b"SCRAM-SHA-256";
             match self.handle_sasl_authentication(stream, &auth_type_text) {
                 Ok(_) => {
@@ -1322,7 +2045,10 @@ mod sasl {
                     Ok(())
                 }
                 Err(e) => {
-                    return Err(AuthError(format!("Error handling SASL authentication: {}", e)));
+                    return Err(AuthError(format!(
+                        "Error handling SASL authentication: {}",
+                        e
+                    )));
                 }
             }
         }
@@ -1521,12 +2247,7 @@ mod tests {
         resp_buf.extend(b"1");
         resp_buf.extend(&(5i32.to_be_bytes())); // col2 len
         resp_buf.extend(b"Alice");
-        let state = &mut QueryState {
-            overflowed: false,
-            overflow_buf: BytesMut::new(),
-            skip_bytes: 0,
-            data_buf_off: 0,
-        };
+        let state = &mut QueryState::default();
         format_data_row(0, 2, &resp_buf, &mut data_buf, state);
         let row = std::str::from_utf8(&data_buf[..state.data_buf_off]).unwrap();
         assert!(row.contains("1|Alice\n"));
@@ -1569,12 +2290,7 @@ mod tests {
 
     #[test]
     fn test_format_data_row_simple() {
-        let mut state = QueryState {
-            overflowed: false,
-            skip_bytes: 0,
-            overflow_buf: BytesMut::new(),
-            data_buf_off: 0,
-        };
+        let mut state = QueryState::default();
         // Simulate a data row with 1 column of length 3 ("abc")
         let mut resp_buf = vec![];
         resp_buf.extend_from_slice(&3i32.to_be_bytes()); // column length
