@@ -358,7 +358,7 @@ impl Replication {
         let mut row_descr = BytesMut::new();
 
         let mut state = QueryState::default();
-        let msg = String::from(format!("COPY {} TO STDOUT", table));
+        let msg = String::from(format!("COPY {} TO STDOUT HEADER DELIMITER ','", table));
 
         if let Some(e) = send_simple_query(stream, &msg) {
             return Err(ReplicationError(format!("Copy Error: {}", e)));
@@ -1514,7 +1514,7 @@ fn process_logical_repl(
                                                 off += val_len as usize;
 
                                                 if (k + 1) < col_num {
-                                                    data_buf[state.data_buf_off] = b'\t';
+                                                    data_buf[state.data_buf_off] = b',';
                                                     state.data_buf_off += 1;
                                                 }
                                             }
