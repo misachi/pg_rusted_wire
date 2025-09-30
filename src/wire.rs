@@ -486,6 +486,9 @@ impl Replication {
                 Ok(SimpleQueryCompletion::CopyError) => {
                     break;
                 }
+                Ok(SimpleQueryCompletion::ReadStreamTimeout) => {
+                    return Err(ReplicationError(format!("Server closed the connection")));
+                }
                 Err(e) => {
                     return Err(ReplicationError(format!(
                         "Error processing simple query: {}",
@@ -762,6 +765,7 @@ pub enum SimpleQueryCompletion {
     CommandError,
     CopyError,
     NoMatch,
+    ReadStreamTimeout
 }
 
 pub fn get_auth_type(_type: i32) -> AuthenticationType {
@@ -1337,7 +1341,7 @@ fn process_logical_repl(
         match stream.read(&mut buf[buf_off..]) {
             Ok(r_size) => {
                 if r_size <= 0 {
-                    is_done = SimpleQueryCompletion::NoMatch;
+                    is_done = SimpleQueryCompletion::ReadStreamTimeout;
                     break;
                 }
 
