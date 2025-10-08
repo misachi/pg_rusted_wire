@@ -1,57 +1,32 @@
 # PG_RUSTED_WIRE
 
-Postgres Wire Protocol implemented in Rust. Currently supports `SCRAM-SHA-256`, `md5` and `password`  authentication.
+PG_RUSTED_WIRE is a Rust implementation of the PostgreSQL Wire Protocol, enabling direct communication with PostgreSQL servers. It supports multiple authentication methods (`SCRAM-SHA-256`, `md5`, and `password`) and provides tools for logical replication and interactive SQL querying. Stream table changes to local files or use the psql-like client for basic database operations, all with a focus on simplicity. This tool is helpful for basic database interactions and testing the wire protocol implementation.
 
 ## Example Usage
 
-Having an entry like this in your `pg_hba.conf` file
-```
-host <database> <user> <ip_address>/24 <auth>  # replace <database>, <user> and <ip_address> appropriately. <auth> should be one of (SCRAM-SHA-256, password, md5)
-```
+### Logical Replication(Streaming to a local file)
+This feature allows you to stream real-time changes from a PostgreSQL table directly to a local file using logical replication. When you start the process, a snapshot of the specified table is first saved as `<table_name>.data` in your chosen directory configured in `with_config_dir`. As new INSERT operations occur in the database, they are appended to this file, enabling you to track changes over time.
 
-Instantiate `StartupMsg` with message details
 ```
-use bytes::BytesMut;
-use std::net::Ipv4Addr;
-use std::str::FromStr;
+let mut client = Client::new(
+    Ipv4Addr::from_str(&args.host).expect("IPV4 address error"),
+    args.port,
+)
+.with_database("my_database") // database to connect to
+.with_user("user") // user with permissions to connect to the database table to be streamed
+.with_replication("database") // this is required for logical replication
+.with_protocol(1234567) // Supported protocol version to use
+.with_config_dir("/my/dir"); // Directory with the right permisions to store the state in. The streamed table file data is also stored here.
 
-use pg_rusted_wire::*;
-
-let mut startup_msg = StartupMsg::new(
-    String::from(DEFAULT_USER),  // User
-    Some(String::from(DEFAULT_USER)), // Database
-    None, // Options
-    None,  // true or false if replication protocol
-);
-```
-
-Create client connection
-```
-let client = Client::new(Ipv4Addr::from_str(DEFAULT_IP).unwrap(), DEFAULT_PORT);
-```
-
-Use client to authenticate and send query
-```
-match client.connect() {  // Handle connection response(fail or success)
+// Connect and start streaming changes from the table
+match client.connect() {
     Ok(mut stream) => {
-        if let Err(e) = client.authenticate(&mut stream, &mut startup_msg, DEFAULT_USER) {
+        if let Err(e) = client.authenticate2(&mut stream, &args.password) {
             eprintln!("Client Authentication: {}", e);
             return;
         }
 
-        // Okay to use stream to send queries at this point
-        let mut msg = "SELECT * FROM foo;"; // First Query; Ensure the user has access to table "foo"
-        let result_buf = &mut BytesMut::new();  // Table columns
-        let row_descr = &mut BytesMut::new();  // Returned row data
-
-        if let Err(e) = process_simple_query(&mut stream, msg, result_buf, row_descr) {
-            eprintln!("Error processing simple query: {}", e);
-            return;
-        }
-
-        // Just print results here
-        println!("Row Description: {:?}", String::from_utf8_lossy(row_descr));
-        println!("Data Buffer: {:?}", String::from_utf8_lossy(result_buf));
+        client.run(&mut stream, &args.table, &args.publication);
     }
     Err(e) => {
         eprintln!("No stream available for client: {}", e);
@@ -59,38 +34,33 @@ match client.connect() {  // Handle connection response(fail or success)
     }
 }
 ```
+To use logical replication, configure the client with your connection details and run the provided example. You can also use the command-line interface for convenience:
 
-Try running the [example](examples/main.rs) (make sure to create table `foo` and update the connection details in the file)
-
-Create table `foo`:
 ```
-CREATE TABLE foo(id SERIAL PRIMARY KEY, k INT NOT NULL);
-INSERT INTO foo SELECT i, 1001+i FROM generate_series(1, 10) i;
+cargo run --example lrepl -- -u <user> -P <password> -H <host> -d <database> -p <port> --table <name> --publication <pub1> --config-dir <dir>
 ```
+> Replace the placeholders with your actual connection information. Use `cargo run --example lrepl -- -h` for help on available flags and defaults.
 
-Command to run example `cargo run --example main`
-Results
+Currently, only INSERT operations are supported. Support for UPDATE and DELETE may be added in the future. When you start the process, a snapshot of the specified table is first saved as `<table_name>.data` in your chosen `--config-dir` directory. Note that only one table can be replicated at a time. This tool is ideal for capturing and auditing table changes or for simple data synchronization tasks.
+
+### PSQL-Like CLient
+A simple interactive SQL client, similar to psql, is included as an example. You can use it to connect to your PostgreSQL database and run queries directly from the terminal.
+
+To start the client, run:
 ```
-Authentication: MD5Password
-
-// Results for first Query
-Done with command tag: "SELECT 10"
-Row Description: "id|k"  // Columns
-Data Buffer: "1|1002 2|1003 3|1004 4|1005 5|1006 6|1007 7|1008 8|1009 9|1010 10|1011 "  // Row data
-
-// Results for second Query
-Done with command tag: "SELECT 4"
-Row Description: "id|k"    // Columns
-Data Buffer: "1|1002 2|1003 3|1004 4|1005 "  // Row Data
+cargo run --example simpsql
 ```
+> Before running, update the connection settings (database name, user, password, host, and port) in the [simpsql](examples/simpsql.rs) file.
 
-You can also use the simple `psql` like example tool with the `cargo run --example simpsql` command. Ensure to update the configuration values in the [psql](examples/psql.rs) file before running the command
-This will show results as follows(assuming `foo` table was created using the SQL above)
+Once running, you can enter SQL commands interactively. Example usage:
 ```
 Client connection
 Use Ctrl+c to end
 
+psql> CREATE TABLE foo(id SERIAL PRIMARY KEY, k INT NOT NULL);
+psql> INSERT INTO foo(k) SELECT i FROM generate_series(1002, 1011) i;
 psql> SELECT * FROM foo;
+
 id|k
 1|1002
 2|1003
@@ -102,15 +72,6 @@ id|k
 8|1009
 9|1010
 10|1011
-
 psql>
-```
 
-# Logical Replication Support
-To use logical replication use the example command below
-```
-cargo run --example lrepl -- -u <user> -P <password> -H <host> -d <database> -p <port> --table <name> --publication <pub1> --config-dir <dir>
-```
-Fill in the <> brackets with valid values for the flags. Use `cargo run --example lrepl -- -h` for details on the required flags and the available defaults.
-
-Currently, you can stream changes to a local file on your system inside the `--config-dir` directory that you provided above. With the commnad, a snapshot of the table is first copied to the file named `<table_name.data>`. Later, DML changes streamed from PG are appended to the file. Only INSERT operation is supported at the moment. UPDATE and DELETE may be added at a later time. You can only replicate one table at a time.
+Results are displayed in a simple, readable format. Use Ctrl+C to exit the client. This tool is useful for basic database operations and testing your PostgreSQL connection.
