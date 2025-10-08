@@ -2207,7 +2207,7 @@ mod tests {
         // Should start with length and protocol version
         assert_eq!(bytes[4..8], PROTOCOL_VERSION.to_be_bytes());
         assert!(bytes.windows(5).any(|w| w == b"user\0"));
-        assert!(bytes.windows(6).any(|w| *w == b"db1\0\0"[..6]));
+        assert!(bytes.windows(4).any(|w| *w == b"db1\0"[..4]));
     }
 
     #[test]
@@ -2239,20 +2239,20 @@ mod tests {
     fn test_format_row_desc_and_data_row() {
         let mut row_descr = BytesMut::new();
         // Simulate a RowDescription message with two columns, names "id" and "name"
-        let resp_buf = b"id\0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
-                       name\0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        let resp_buf = b"id\0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00name\0\x00\x00";
         format_row_desc(0, 2, resp_buf, &mut row_descr);
         assert!(row_descr.windows(1).any(|w| w == b"|"));
 
         let mut data_buf = [0u8; 128];
         // Simulate DataRow: 2 columns, "1" and "Alice"
         let mut resp_buf = vec![];
+        resp_buf.extend_from_slice(b"0000000"); // 7 bytes to account for message type byte, 4 byte for content size, 2 bytes for column number
         resp_buf.extend(&(1i32.to_be_bytes())); // col1 len
         resp_buf.extend(b"1");
         resp_buf.extend(&(5i32.to_be_bytes())); // col2 len
         resp_buf.extend(b"Alice");
         let state = &mut QueryState::default();
-        format_data_row(0, 2, &resp_buf, &mut data_buf, state);
+        format_data_row(7, 2, &resp_buf, &mut data_buf, state);
         let row = std::str::from_utf8(&data_buf[..state.data_buf_off]).unwrap();
         assert!(row.contains("1|Alice\n"));
     }
@@ -2286,7 +2286,7 @@ mod tests {
         let mut out_buf = BytesMut::new();
         // Simulate a row description with two columns: "id\0" and "name\0"
         let resp_buf =
-            b"id\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0name\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+            b"id\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0name\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
         format_row_desc(0, 2, resp_buf, &mut out_buf);
         let as_str = String::from_utf8_lossy(&out_buf);
         assert!(as_str.contains("id|name"));
@@ -2297,10 +2297,11 @@ mod tests {
         let mut state = QueryState::default();
         // Simulate a data row with 1 column of length 3 ("abc")
         let mut resp_buf = vec![];
+        resp_buf.extend_from_slice(b"0000000"); // 7 bytes to account for message type byte, 4 byte for content size, 2 bytes for column number
         resp_buf.extend_from_slice(&3i32.to_be_bytes()); // column length
         resp_buf.extend_from_slice(b"abc"); // column data
         let mut out_buf = [0u8; 16];
-        format_data_row(0, 1, &resp_buf, &mut out_buf, &mut state);
+        format_data_row(7, 1, &resp_buf, &mut out_buf, &mut state); 
         let result = std::str::from_utf8(&out_buf[..state.data_buf_off]).unwrap();
         assert_eq!(result, "abc\n");
     }
