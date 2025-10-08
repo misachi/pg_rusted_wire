@@ -139,6 +139,7 @@ impl ReplicationInfo {
         Path::new(&path).exists()
     }
 
+    // Load replication state from file
     fn load(&self) -> io::Result<ReplicationInfo> {
         if !ReplicationInfo::path_exists(&self.meta_file_path) {
             return Err(io::Error::new(
@@ -161,6 +162,7 @@ impl ReplicationInfo {
         }
     }
 
+    // Save replication state to file
     fn dump(&self) -> io::Result<()> {
         let path = Path::new(&self.meta_file_path);
         let mut buf = [0; BUF_LEN];
@@ -211,6 +213,7 @@ impl Replication {
         self.info.sys_id == sys_id
     }
 
+    /// Confirm the replication slot exists
     fn check_slot_exists(
         &mut self,
         stream: &mut std::net::TcpStream,
@@ -252,6 +255,7 @@ impl Replication {
         Ok(false)
     }
 
+    /// Identify the server and populate ReplicationInfo
     fn identify(&mut self, stream: &mut std::net::TcpStream) -> Result<(), ReplicationError> {
         let mut result_buf = [0; BUF_LEN];
         let mut row_descr = BytesMut::new();
@@ -273,16 +277,10 @@ impl Replication {
             return Err(ReplicationError(format!("Invalid System ID")));
         }
 
-        println!("{}", String::from_utf8_lossy(parts[1]));
-
         let timeline = String::from_utf8_lossy(parts[1]);
-        //: [u8; 1] = parts[1].try_into().unwrap();
-
-        // println!("{}", String::from_utf8_lossy(&timeline));
 
         self.info.sys_id = sys_id;
         self.info.timeline = timeline.parse().unwrap();
-        //= u8::from_le_bytes(timeline);
         self.info.start_lsn = String::from_utf8_lossy(&parts[2]).to_string();
 
         if let Err(e) = self.info.dump() {
@@ -291,6 +289,7 @@ impl Replication {
         Ok(())
     }
 
+    /// Create a logical replication slot if it does not exist
     fn create_slot(
         &mut self,
         stream: &mut std::net::TcpStream,
@@ -345,10 +344,10 @@ impl Replication {
             )));
         }
 
-        // Check for query results here
         Ok(())
     }
 
+    /// Perform a COPY TO STDOUT to get a consistent snapshot of the table
     fn copy_snapshot(
         &mut self,
         stream: &mut std::net::TcpStream,
@@ -438,6 +437,7 @@ impl Replication {
         }
     }
 
+    /// Start the replication stream
     fn start(
         &mut self,
         stream: &mut std::net::TcpStream,
@@ -501,6 +501,7 @@ impl Replication {
             result_buf.fill(0);
             row_descr.clear();
 
+            // Slow down a bit to avoid busy waiting
             thread::sleep(time::Duration::from_millis(WAIT_OFF_CPU));
         }
         Ok(())
@@ -653,7 +654,7 @@ impl Client {
         Ok(())
     }
 
-    // To be deleted once examples using it are updated
+    // TODO: To be deleted once examples using it are updated
     pub fn authenticate(
         &self,
         stream: &mut TcpStream,
@@ -765,7 +766,7 @@ pub enum SimpleQueryCompletion {
     CommandError,
     CopyError,
     NoMatch,
-    ReadStreamTimeout
+    ReadStreamTimeout,
 }
 
 pub fn get_auth_type(_type: i32) -> AuthenticationType {
@@ -789,6 +790,7 @@ fn add_buf_len(buf: &mut BytesMut, start_pos: usize, buf_len: i32) {
     buf[start_pos..start_pos + 4].copy_from_slice(&temp_buf);
 }
 
+/// Example function for how row descriptions will be formatted
 fn format_row_desc(off: usize, num_cols: i16, resp_buf: &[u8], out_buf: &mut BytesMut) {
     let mut off = off; // coerce offset to mutable type
     let idx_fn = |buf: &[u8]| -> u32 {
@@ -857,6 +859,7 @@ fn format_data_row(
     state.data_buf_off += 1;
 }
 
+/// Send simple query message to the server
 pub fn send_simple_query(stream: &mut TcpStream, msg: &str) -> Option<SimpleQueryError> {
     let mut bytes = BytesMut::new();
 
@@ -878,6 +881,8 @@ pub fn send_simple_query(stream: &mut TcpStream, msg: &str) -> Option<SimpleQuer
     None
 }
 
+/// Processing simple query message formats.
+/// See https://www.postgresql.org/docs/current/protocol-message-formats.html
 fn process_simple_query_codes(
     buf: &[u8],
     off: &mut usize,
@@ -935,7 +940,7 @@ fn process_simple_query_codes(
                 r as usize
             };
 
-            // See https://www.postgresql.org/docs/17/protocol-error-fields.html#PROTOCOL-ERROR-FIELDS
+            // Parse error message from server. See https://www.postgresql.org/docs/current/protocol-error-fields.html#PROTOCOL-ERROR-FIELDS
             let out_msg = || -> BytesMut {
                 let mut _off: usize = 0;
                 let mut msg_out = BytesMut::with_capacity(BUF_LEN);
@@ -945,6 +950,7 @@ fn process_simple_query_codes(
                     let mut err_msg: &[u8];
 
                     if buf[_off] == b'V' {
+                        // Severity
                         _off += 1; // Skip error severity character
                         err_msg = &buf[_off..];
                         let end = char_idx_fn(err_msg, b'\0');
@@ -954,6 +960,7 @@ fn process_simple_query_codes(
                     }
 
                     if buf[_off] == b'M' {
+                        // Message containing error details
                         _off += 1; // Skip error message character
                         err_msg = &buf[_off..];
                         let end = char_idx_fn(err_msg, b'\0');
@@ -970,7 +977,6 @@ fn process_simple_query_codes(
                 eprintln!("Simple Query Error: {}", e);
             }
             is_done = SimpleQueryCompletion::CommandError;
-            // break 'attempt_read;
         }
         b'T' => {
             // T for RowDescription
@@ -1037,6 +1043,7 @@ fn process_simple_query_codes(
     is_done
 }
 
+/// See https://www.postgresql.org/docs/current/protocol-message-formats.html
 pub fn process_simple_query(
     stream: &mut TcpStream,
     data_buf: &mut [u8],
@@ -1262,6 +1269,10 @@ pub fn process_simple_query(
     Ok(is_done)
 }
 
+/// When we read incomplete data at the end of the response buffer, we copy the remaining slice to overflow buffer
+/// and set the skip_bytes to the number of bytes we need to skip in the next read
+/// to complete the message. Once we have enough data, we process the overflow buffer
+/// to extract the complete message and copy to the data buffer.
 fn handle_overflowed(
     data_buf: &mut [u8],
     state: &mut QueryState,
@@ -1318,6 +1329,7 @@ fn process_simple(
     ret
 }
 
+/// Logical replication protocol messages are processed in this function. Copy is also handled here
 fn process_logical_repl(
     stream: &mut TcpStream,
     data_buf: &mut [u8],
@@ -1329,6 +1341,7 @@ fn process_logical_repl(
     let mut buf_off = 0;
     let mut is_done: SimpleQueryCompletion;
 
+    // Handle any overflowed data(if any) from previous read
     if state.skip_bytes > 0 {
         buf[..state.skip_bytes as usize]
             .copy_from_slice(&state.overflow_buf[..state.skip_bytes as usize]);
@@ -1726,9 +1739,11 @@ mod md5password {
                         )));
                     }
 
-                    let complete_tag = (&response[5..9]).get_i32(); // Check 4 byte value for completion status
+                    // Get word indicating if authentication was successful. Starts at byte 5, after byte identifier and length
+                    let complete_tag = (&response[5..9]).get_i32();
+
+                    // 0 signifies SASL authentication was successful(AuthenticationOk )
                     if complete_tag != 0 {
-                        // 0 signifies SASL authentication was successful(AuthenticationOk )
                         return Err(AuthError(format!("Auth incomplete: {}", complete_tag)));
                     }
                 }
@@ -1803,9 +1818,11 @@ mod textpassword {
                         )));
                     }
 
-                    let complete_tag = (&response[5..9]).get_i32(); // Check 4 byte value for completion status
+                    // Get word indicating if authentication was successful. Starts at byte 5, after byte identifier and length
+                    let complete_tag = (&response[5..9]).get_i32();
+
+                    // 0 signifies SASL authentication was successful(AuthenticationOk )
                     if complete_tag != 0 {
-                        // 0 signifies SASL authentication was successful(AuthenticationOk )
                         return Err(AuthError(format!("Auth incomplete: {}", complete_tag)));
                     }
                 }
@@ -1823,6 +1840,8 @@ mod textpassword {
 }
 
 mod sasl {
+    // See https://www.postgresql.org/docs/current/sasl-authentication.html#SASL-SCRAM-SHA-256
+    // and RFCs 7677 and 5802 for details
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use bytes::{Buf, BufMut, BytesMut};
@@ -1950,10 +1969,14 @@ mod sasl {
                         )));
                     }
 
+                    // Length of the message is 4 bytes after the byte identifier
                     let msg_len: i32 = (&buf[1..5]).get_i32();
+
+                    // Get word indicating if authentication was successful. Starts at byte 5, after byte identifier and length
                     let mut complete_tag = (&buf[5..9]).get_i32();
+
+                    // 12 signifies SASL authentication has completed(AuthenticationSASLFinal)
                     if complete_tag != 12 {
-                        // 12 signifies SASL authentication has completed(AuthenticationSASLFinal)
                         return Err(AuthError(format!(
                             "Authentication incomplete: {}",
                             complete_tag
@@ -1968,9 +1991,11 @@ mod sasl {
                         )));
                     }
 
+                    // Get word indicating if authentication was successful. Starts at byte 5, after byte identifier and length
                     complete_tag = (&response[5..9]).get_i32();
+
+                    // 0 signifies SASL authentication was successful(AuthenticationOk )
                     if complete_tag != 0 {
-                        // 0 signifies SASL authentication was successful(AuthenticationOk )
                         return Err(AuthError(format!(
                             "Authentication incomplete: {}",
                             complete_tag
@@ -2007,8 +2032,12 @@ mod sasl {
 
                         if response[0] == b'R' {
                             // 'R' for SASLFinalResponse
+
+                            // Length of the message is 4 bytes after the byte identifier
                             let msg_len: i32 = (&buf[1..5]).get_i32();
-                            let resp_data: &[u8] = &buf[9..msg_len as usize + 1]; // +1 since the limit is exlusive
+
+                            // +1 since the limit is exclusive
+                            let resp_data: &[u8] = &buf[9..msg_len as usize + 1];
 
                             if let Err(e) = self.send_client_sasl_response(&pass, stream, resp_data)
                             {
@@ -2301,7 +2330,7 @@ mod tests {
         resp_buf.extend_from_slice(&3i32.to_be_bytes()); // column length
         resp_buf.extend_from_slice(b"abc"); // column data
         let mut out_buf = [0u8; 16];
-        format_data_row(7, 1, &resp_buf, &mut out_buf, &mut state); 
+        format_data_row(7, 1, &resp_buf, &mut out_buf, &mut state);
         let result = std::str::from_utf8(&out_buf[..state.data_buf_off]).unwrap();
         assert_eq!(result, "abc\n");
     }
