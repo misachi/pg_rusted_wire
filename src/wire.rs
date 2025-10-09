@@ -393,7 +393,7 @@ impl Replication {
         let mut row_descr = BytesMut::new();
 
         let mut state = QueryState::default();
-        let msg = String::from(format!("COPY {} TO STDOUT HEADER DELIMITER ','", table));
+        let msg = String::from(format!("COPY {} TO STDOUT DELIMITER ','", table));
 
         if let Some(e) = send_simple_query(stream, &msg) {
             return Err(ReplicationError(format!("Copy Error: {}", e)));
