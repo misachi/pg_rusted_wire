@@ -8,12 +8,15 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, read_to_string};
 use std::io;
 use std::io::{Read, Seek, Write, stdout};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::Path;
 use std::{thread, time};
+
+use std::ffi::CString;
+// use std::fs;
 
 const BUF_LEN: usize = 1024; // Buffer size for reading from the stream
 pub const PROTOCOL_VERSION: i32 = 196608; // 3.0.0 in PostgreSQL protocol versioning
@@ -112,80 +115,12 @@ impl DoIO for OutResource {
                 Ok(())
             }
             OutResource::Iceberg(_) => Python::attach(|py| {
-                let fun: Py<PyAny> = PyModule::from_code(
-                        py,
-                        c_str!(
-                            "
-import io
-import sys
-from pyiceberg.catalog import load_catalog
-import sqlalchemy.exc
-import pyarrow as pa
-from pyarrow import csv
+                let py_app = CString::new(read_to_string(Path::new("pyiceberg.py"))?)?;
+                let app: Py<PyAny> = PyModule::from_code(
+                    py, py_app.as_c_str(), c_str!("pyiceberg.py"), c_str!("")
+                )?.getattr("write_to_table")?.into();
 
-# S3 access details
-S3_SECRET_KEY = 'pass1234'
-S3_ENDPOINT = 'http://1.1.1.1:9000'
-S3_ACCESS_KEY = 'minio_user'
-
-# Catalog connection details
-CAT_PASSWORD = 'password' # Password to catalog store
-CAT_USERNAME = 'user' # Username to catalog store
-CATALOG_URI = 'postgresql+psycopg2://{}:{}@2.2.2.2:5432/iceberg'.format(CAT_USERNAME, CAT_PASSWORD) # Postgres Catalog
-
-# Iceberg table details
-TABLE_NAME = 'catalog_todo.example_s3_schema.employees_test' # Full table name in the format catalog.schema.table
-ICEBERG_CATALOG, ICEBERG_SCHEMA, ICEBERG_TABLE = TABLE_NAME.split('.')
-
-def upload_to_iceberg(df: pa.Table):
-    catalog = load_catalog(
-        ICEBERG_CATALOG,
-        **{
-            'uri': CATALOG_URI,
-            's3.endpoint': S3_ENDPOINT,
-            'py-io-impl': 'pyiceberg.io.pyarrow.PyArrowFileIO',
-            's3.access-key-id': S3_ACCESS_KEY,
-            's3.secret-access-key': S3_SECRET_KEY,
-            'init_catalog_tables': 'false'
-        }
-    )
-
-    try:
-        table = '{}.{}'.format(ICEBERG_SCHEMA, ICEBERG_TABLE)
-        if catalog.table_exists(table):
-            tbl = catalog.load_table(table)
-        else:
-            print('Table does not exist')
-            sys.exit(1)
-    except sqlalchemy.exc.OperationalError as e:
-        print('Error connecting to the database:', e)
-        sys.exit(1)
-    except OSError as e:
-        print('Error accessing S3 storage:', e)
-        sys.exit(1)
-    
-    # Ensure the dataframe matches the table schema
-    schema = tbl.schema().as_arrow()
-    df = df.cast(schema)
-
-    tbl.upsert(df, ['id'])
-
-def write_to_table(*args, **kwargs):
-    source = io.BytesIO(bytes(args[0]))
-    table = csv.read_csv(source, read_options=csv.ReadOptions(
-        column_names=['id', 'name', 'salary'], encoding='utf8')
-    )
-
-    upload_to_iceberg(table)
-"
-                        ),
-                        c_str!("write_to_table.py"),
-                        c_str!(""),
-                    )?
-                    .getattr("write_to_table")?
-                    .into();
-
-                fun.call1(py, (data,))?;
+                app.call1(py, (data,))?;
 
                 Ok(())
             }),
