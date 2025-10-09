@@ -65,13 +65,11 @@ struct TableInfo {
 }
 
 impl TableInfo {
-    fn new(config_dir: &str, name: &str) -> Self {
-        let data_path = format!("{}/{}{}", config_dir, name, REPLICATION_DATA_FILE_EXT);
-
+    fn new(out_res: OutResource, name: &str) -> Self {
         Self {
             name: name.to_string(),
             slot: format!("{}_slot", name),
-            out_resource: OutResource::new(&data_path),
+            out_resource: out_res,
             ..Default::default()
         }
     }
@@ -83,16 +81,9 @@ pub trait DoIO {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum OutResource {
+pub enum OutResource {
     CSVFile(String),
     Iceberg(String),
-}
-
-impl OutResource {
-    fn new(path: &str) -> Self {
-        // OutResource::CSVFile(Path::new(path).to_string_lossy().to_string())
-        OutResource::Iceberg(path.to_string())
-    }
 }
 
 impl Default for OutResource {
@@ -114,13 +105,14 @@ impl DoIO for OutResource {
 
                 Ok(())
             }
-            OutResource::Iceberg(_) => Python::attach(|py| {
+            OutResource::Iceberg(path) => Python::attach(|py| {
                 let py_app = CString::new(read_to_string(Path::new("pyiceberg.py"))?)?;
-                let app: Py<PyAny> = PyModule::from_code(
-                    py, py_app.as_c_str(), c_str!("pyiceberg.py"), c_str!("")
-                )?.getattr("write_to_table")?.into();
+                let app: Py<PyAny> =
+                    PyModule::from_code(py, py_app.as_c_str(), c_str!("pyiceberg.py"), c_str!(""))?
+                        .getattr("write_to_table")?
+                        .into();
 
-                app.call1(py, (data,))?;
+                app.call1(py, (data, Path::new(path)))?;
 
                 Ok(())
             }),
@@ -330,27 +322,12 @@ impl Replication {
         &mut self,
         stream: &mut std::net::TcpStream,
         table: &str,
-        publication: &str,
     ) -> Result<(), ReplicationError> {
         let mut result_buf = [0; BUF_LEN];
         let mut row_descr = BytesMut::new();
 
         let mut state = QueryState::default();
-        let table_info: &TableInfo;
-
-        if let Some(info) = self.info.table.get(table) {
-            table_info = info;
-        } else {
-            let mut info = TableInfo::new(&self.config_dir.clone().unwrap(), table);
-            info.publication = publication.to_string();
-            self.info.table.insert(table.to_string(), info);
-            self.info.dump().expect("Unable to save table details");
-            table_info = self
-                .info
-                .table
-                .get(table)
-                .expect("Error creating new table");
-        }
+        let table_info: &TableInfo = self.info.table.get(table).expect("Table must exist");
 
         let msg = String::from(format!(
             "CREATE_REPLICATION_SLOT {} LOGICAL pgoutput",
@@ -761,12 +738,42 @@ impl Client {
         Ok(())
     }
 
-    pub fn run(&mut self, stream: &mut std::net::TcpStream, table: &str, publication_name: &str) {
+    pub fn run(
+        &mut self,
+        stream: &mut std::net::TcpStream,
+        table: &str,
+        publication_name: &str,
+        out_res: Option<OutResource>,
+    ) {
         let replication = self.replication.as_mut().expect("Replication must be set");
 
-        replication
-            .create_slot(stream, table, publication_name)
-            .unwrap();
+        let out_res = match out_res {
+            Some(res) => res,
+            None => OutResource::CSVFile(format!(
+                "{}/{}{}",
+                replication.config_dir.as_ref().unwrap(),
+                table,
+                REPLICATION_DATA_FILE_EXT
+            )),
+        };
+
+        if let Some(info) = replication.info.table.get_mut(table) {
+            info.out_resource = out_res;
+            replication
+                .info
+                .dump()
+                .expect("Unable to save table details");
+        } else {
+            let mut info = TableInfo::new(out_res, table);
+            info.publication = publication_name.to_string();
+            replication.info.table.insert(table.to_string(), info);
+            replication
+                .info
+                .dump()
+                .expect("Unable to save table details");
+        }
+
+        replication.create_slot(stream, table).unwrap();
 
         if !replication.snapshot_taken(table) {
             replication.copy_snapshot(stream, table).unwrap()
