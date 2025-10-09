@@ -26,3 +26,7 @@ path = "src/lib.rs"
 #[[bin]]
 #name = "pg_rusted_wire_exec"
 #path = "src/main.rs"
+
+[dependencies.pyo3]
+version = "0.26.0"
+features = ["auto-initialize"]
