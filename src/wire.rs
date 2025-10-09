@@ -106,7 +106,7 @@ impl DoIO for OutResource {
                 Ok(())
             }
             OutResource::Iceberg(path) => Python::attach(|py| {
-                let py_app = CString::new(read_to_string(Path::new("pyiceberg.py"))?)?;
+                let py_app = CString::new(read_to_string(Path::new("../pyiceberg.py"))?)?;
                 let app: Py<PyAny> =
                     PyModule::from_code(py, py_app.as_c_str(), c_str!("pyiceberg.py"), c_str!(""))?
                         .getattr("write_to_table")?
