@@ -56,7 +56,7 @@ struct TableInfo {
     slot: String,      // Slot name
     publication: String,
     snapshot_done: bool,
-    out_resource: FileOutResource,
+    out_resource: OutResource,
 }
 
 impl TableInfo {
@@ -66,46 +66,74 @@ impl TableInfo {
         Self {
             name: name.to_string(),
             slot: format!("{}_slot", name),
-            out_resource: FileOutResource::new(&data_path),
+            out_resource: OutResource::new(&data_path),
             ..Default::default()
         }
     }
 }
 
-pub trait OutResource {
+pub trait DoIO {
     fn write(&self, data: &[u8]) -> io::Result<()>;
     fn read(&self, data: &mut [u8], pos: u64) -> io::Result<usize>;
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-struct FileOutResource {
-    path: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum OutResource {
+    CSVFile(String),
+    Iceberg(String),
 }
 
-impl FileOutResource {
+impl OutResource {
     fn new(path: &str) -> Self {
-        Self {
-            path: Path::new(path).to_string_lossy().to_string(),
-        }
+        // OutResource::CSVFile(Path::new(path).to_string_lossy().to_string())
+        OutResource::Iceberg(path.to_string())
     }
 }
 
-impl OutResource for FileOutResource {
+impl Default for OutResource {
+    fn default() -> Self {
+        OutResource::CSVFile(String::new())
+    }
+}
+
+impl DoIO for OutResource {
     fn write(&self, data: &[u8]) -> io::Result<()> {
-        let path = Path::new(&self.path);
+        match self {
+            OutResource::CSVFile(path) => {
+                let path = Path::new(&path);
 
-        let mut handle = OpenOptions::new().append(true).create(true).open(path)?;
+                let mut handle = OpenOptions::new().append(true).create(true).open(path)?;
 
-        handle.write_all(data)?;
-        handle.sync_all()?; // Flush to disk immediately
+                handle.write_all(data)?;
+                handle.sync_all()?; // Flush to disk immediately
 
-        Ok(())
+                Ok(())
+            }
+            OutResource::Iceberg(_) => {
+                // Placeholder for Iceberg write logic
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Iceberg write not implemented",
+                ))
+            }
+        }
     }
 
     fn read(&self, data: &mut [u8], pos: u64) -> io::Result<usize> {
-        let mut handle = File::open(&self.path)?;
-        let _ = handle.seek(io::SeekFrom::Start(pos));
-        return handle.read(data);
+        match self {
+            OutResource::CSVFile(path) => {
+                let mut handle = File::open(&path)?;
+                let _ = handle.seek(io::SeekFrom::Start(pos));
+                return handle.read(data);
+            }
+            OutResource::Iceberg(_) => {
+                // Placeholder for Iceberg read logic
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Iceberg read not implemented",
+                ))
+            }
+        }
     }
 }
 
@@ -427,10 +455,15 @@ impl Replication {
         Ok(())
     }
 
-    fn write_to(&mut self, out_res: &FileOutResource, result_buf: &[u8], state: &QueryState) {
+    fn write_to(&mut self, out_res: &OutResource, result_buf: &[u8], state: &QueryState) {
         let mut off = state.data_buf_off;
         if off <= 0 {
             off = state.recycle_buf_off;
+        }
+
+        // Ignore if no data to write
+        if off <= 0 {
+            return;
         }
         if let Err(e) = out_res.write(&result_buf[..off]) {
             eprintln!("Error when writing to stdout for DataRow: {}", e);
