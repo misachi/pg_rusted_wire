@@ -54,7 +54,21 @@ fn main() {
                 return;
             }
 
-            client.run(&mut stream, &args.table, &args.publication);
+            // Start streaming to a local CSV file
+            client.run(
+                &mut stream,
+                &args.table,
+                &args.publication,
+                None,
+            );
+
+            // Start streaming to an iceberg file
+            // client.run(
+            //     &mut stream,
+            //     &args.table,
+            //     &args.publication,
+            //     Some(OutResource::Iceberg("../.tmp/config".to_string())),
+            // );
         }
         Err(e) => {
             eprintln!("No stream available for client: {}", e);
