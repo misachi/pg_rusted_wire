@@ -1,6 +1,6 @@
 import io
 import sys
-from typing import Any
+from typing import Any, Optional
 from pyiceberg.catalog import load_catalog, Catalog
 import sqlalchemy.exc
 import pyarrow as pa
@@ -81,18 +81,19 @@ def upload_to_iceberg(df: pa.Table, *args: Any) -> None:
     # provided, use them for upsert. If not, use all columns. Also when no
     # columns are provided, use the iceberg table schema. This is applicable
     # when performing the initial snapshot loading.
+    schema: Optional[pa.Schema] = None
     if args[3]:
-        schema: pa.Schema = tbl.schema().as_arrow()
+        schema = tbl.schema().as_arrow()
         df = df.cast(schema)
 
         tbl.upsert(df, args[3])
     else:
         source = io.BytesIO(bytes(args[0]))
-        df: pa.Table = csv.read_csv(source, read_options=csv.ReadOptions(
+        df = csv.read_csv(source, read_options=csv.ReadOptions(
             column_names=tbl.metadata.schema().column_names, encoding='utf8')
         )
 
-        schema: pa.Schema = tbl.schema().as_arrow()
+        schema = tbl.schema().as_arrow()
         df = df.cast(schema)
 
         # Use all columns from the iceberg table schema
@@ -105,10 +106,10 @@ def write_to_table(*args: Any, **kwargs: Any) -> None:
             "Expected exactly 4 arguments: data, config_file_path, columns and key_columns")
 
     source = io.BytesIO(bytes(args[0]))
-    table: pa.Table = None
+    table: Optional[pa.Table] = None
 
     if args[2]:
-        table: pa.Table = csv.read_csv(source, read_options=csv.ReadOptions(
+        table = csv.read_csv(source, read_options=csv.ReadOptions(
             column_names=args[2], encoding='utf8')
         )
 
