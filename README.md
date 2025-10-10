@@ -1,13 +1,23 @@
 # PG_RUSTED_WIRE
 
-PG_RUSTED_WIRE is a Rust implementation of the PostgreSQL Wire Protocol, enabling direct communication with PostgreSQL servers. It supports multiple authentication methods (`SCRAM-SHA-256`, `md5`, and `password`) and provides tools for logical replication and interactive SQL querying. Stream table changes to local files or use the psql-like client for basic database operations, all with a focus on simplicity. This tool is helpful for basic database interactions and testing the wire protocol implementation.
+`pg_rusted_wire` is a Rust implementation of the PostgreSQL Wire Protocol, enabling direct communication with PostgreSQL servers. It supports multiple authentication methods (`SCRAM-SHA-256`, `md5`, and `password`) and provides tools for logical replication and interactive SQL querying.
+
+Stream table changes to Iceberg tables(or local files) or use the psql-like client for basic database operations, all with a focus on simplicity. This tool is helpful for basic database interactions and testing the wire protocol implementation.
+
+## Requirements
+Streaming to an iceberg table requires the dependencies listed below
+1. Python shared library `python3-dev` for Ubuntu or `python3-devel` for RPM based distributions
+2. PyIceberg which can be installed with the command `pip install "pyiceberg[s3fs,sql-postgres]"`. Replace `sql-postgres` with a Catalog store of your choice. Check [https://py.iceberg.apache.org/#installation](https://py.iceberg.apache.org/#installation) for more information.
+3. PyArrow. Install with `pip install pyarrow`
 
 ## Example Usage
 
 ### Logical Replication
 
 #### Streaming to a local file
-This feature allows you to stream real-time changes from a PostgreSQL table directly to a local file using logical replication. When you start the process, a snapshot of the specified table is first saved as `<table_name>.data` in your chosen directory configured in `with_config_dir`. As new INSERT operations occur in the database, they are appended to this file, enabling you to track changes over time.
+This feature allows you to stream real-time changes from a PostgreSQL table directly to a local file using logical replication. When you start the process, a snapshot of the specified table is first saved as `<table_name>.data` in your chosen directory configured in `with_config_dir`.
+
+As new INSERT operations occur in the database, they are appended to this file, enabling you to track changes over time.
 
 ```
 use std::net::Ipv4Addr;
