@@ -5,6 +5,7 @@ use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::time::Duration;
 
+use pg_rusted_wire::auth::StartupMsg;
 use pg_rusted_wire::wire::*;
 
 const DEFAULT_USER: &str = "postgres";

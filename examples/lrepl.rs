@@ -6,6 +6,7 @@ use clap::Parser;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
+use pg_rusted_wire::auth::PROTOCOL_VERSION;
 use pg_rusted_wire::wire::*;
 
 const DEFAULT_USER: &str = "postgres";
@@ -55,12 +56,7 @@ fn main() {
             }
 
             // Start streaming to a local CSV file
-            client.run(
-                &mut stream,
-                &args.table,
-                &args.publication,
-                None,
-            );
+            client.run(&mut stream, &args.table, &args.publication, None);
 
             // Start streaming to an iceberg file
             // client.run(
