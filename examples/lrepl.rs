@@ -67,7 +67,7 @@ fn main() {
             //     &mut stream,
             //     &args.table,
             //     &args.publication,
-            //     Some(OutResource::Iceberg("../.tmp/config".to_string())),
+            //     Some(OutResource::Iceberg{config_path: ".tmp/config".to_string(), schema: None, key: None}),
             // );
         }
         Err(e) => {

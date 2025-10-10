@@ -48,8 +48,8 @@ def parse_config_file(file_path: str) -> None:
         sys.exit(1)
 
 
-def upload_to_iceberg(df: pa.Table, file_path: str) -> None:
-    parse_config_file(file_path)
+def upload_to_iceberg(df: pa.Table, *args: Any) -> None:
+    parse_config_file(args[1])
 
     catalog: Catalog = load_catalog(
         ICEBERG_CATALOG,
@@ -77,20 +77,39 @@ def upload_to_iceberg(df: pa.Table, file_path: str) -> None:
         print('Error accessing S3 storage:', e)
         sys.exit(1)
 
-    # Ensure the dataframe matches the table schema
-    schema: pa.Schema = tbl.schema().as_arrow()
-    df = df.cast(schema)
+    # Ensure the dataframe matches the table schema. If key columns are
+    # provided, use them for upsert. If not, use all columns. Also when no
+    # columns are provided, use the iceberg table schema. This is applicable
+    # when performing the initial snapshot loading.
+    if args[3]:
+        schema: pa.Schema = tbl.schema().as_arrow()
+        df = df.cast(schema)
 
-    tbl.upsert(df, ['id'])
+        tbl.upsert(df, args[3])
+    else:
+        source = io.BytesIO(bytes(args[0]))
+        df: pa.Table = csv.read_csv(source, read_options=csv.ReadOptions(
+            column_names=tbl.metadata.schema().column_names, encoding='utf8')
+        )
+
+        schema: pa.Schema = tbl.schema().as_arrow()
+        df = df.cast(schema)
+
+        # Use all columns from the iceberg table schema
+        tbl.upsert(df, tbl.metadata.schema().column_names)
 
 
 def write_to_table(*args: Any, **kwargs: Any) -> None:
-    if len(args) != 2:
+    if len(args) != 4:
         raise ValueError(
-            "Expected exactly two arguments: data and config_file_path")
+            "Expected exactly 4 arguments: data, config_file_path, columns and key_columns")
 
     source = io.BytesIO(bytes(args[0]))
-    table: pa.Table = csv.read_csv(source, read_options=csv.ReadOptions(
-        column_names=['id', 'name', 'salary'], encoding='utf8')
-    )
-    upload_to_iceberg(table, args[1])
+    table: pa.Table = None
+
+    if args[2]:
+        table: pa.Table = csv.read_csv(source, read_options=csv.ReadOptions(
+            column_names=args[2], encoding='utf8')
+        )
+
+    upload_to_iceberg(table, *args)

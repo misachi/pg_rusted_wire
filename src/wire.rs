@@ -61,6 +61,7 @@ struct TableInfo {
     slot: String,      // Slot name
     publication: String,
     snapshot_done: bool,
+    key_columns: Vec<String>, // Primary key columns
     out_resource: OutResource,
 }
 
@@ -83,7 +84,11 @@ pub trait DoIO {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OutResource {
     CSVFile(String),
-    Iceberg(String),
+    Iceberg {
+        config_path: String,
+        schema: Option<Vec<String>>,
+        key: Option<Vec<String>>,
+    }, // Path to config file and optional list of key columns
 }
 
 impl Default for OutResource {
@@ -105,14 +110,21 @@ impl DoIO for OutResource {
 
                 Ok(())
             }
-            OutResource::Iceberg(path) => Python::attach(|py| {
-                let py_app = CString::new(read_to_string(Path::new("../pyiceberg.py"))?)?;
+            OutResource::Iceberg {
+                config_path,
+                schema,
+                key,
+            } => Python::attach(|py| {
+                let py_app = CString::new(read_to_string(Path::new("pyiceberg.py"))?)?;
                 let app: Py<PyAny> =
                     PyModule::from_code(py, py_app.as_c_str(), c_str!("pyiceberg.py"), c_str!(""))?
                         .getattr("write_to_table")?
                         .into();
 
-                app.call1(py, (data, Path::new(path)))?;
+                app.call1(
+                    py,
+                    (data, Path::new(config_path), schema.clone(), key.clone()),
+                )?;
 
                 Ok(())
             }),
@@ -126,7 +138,11 @@ impl DoIO for OutResource {
                 let _ = handle.seek(io::SeekFrom::Start(pos));
                 return handle.read(data);
             }
-            OutResource::Iceberg(_) => {
+            OutResource::Iceberg {
+                config_path: _,
+                schema: _,
+                key: _,
+            } => {
                 // Placeholder for Iceberg read logic
                 Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -1625,16 +1641,39 @@ fn process_logical_repl(
                                             // Include column number
                                             off += 2;
                                             for _ in 0..num_cols {
-                                                // Ignore flags byte
-                                                off += 1;
-                                                let parts: &Vec<&[u8]> = &xlog_data[off..]
+                                                let parts: &Vec<&[u8]> = &xlog_data[off + 1..]
                                                     .split(|&b| b == b'\0')
                                                     .collect();
                                                 table_info.cols.push(
                                                     String::from_utf8_lossy(parts[0]).to_string(),
                                                 );
-                                                // 2 ints for column oid and column type modifier and C-string terminator
-                                                off += 9 + parts[0].len();
+
+                                                // Check if column is part of the key
+                                                // '1' indicates part of key, '0' otherwise
+                                                if xlog_data[off] == 1 {
+                                                    table_info.key_columns.push(
+                                                        String::from_utf8_lossy(parts[0])
+                                                            .to_string(),
+                                                    );
+                                                }
+                                                // 2 ints for column oid and column type modifier and C-string terminator and flags byte
+                                                off += 10 + parts[0].len();
+                                            }
+
+                                            // Update out_resource with schema and key info if Iceberg
+                                            match &table_info.out_resource {
+                                                OutResource::CSVFile(_) => (),
+                                                OutResource::Iceberg {
+                                                    config_path,
+                                                    schema: _,
+                                                    key: _,
+                                                } => {
+                                                    table_info.out_resource = OutResource::Iceberg {
+                                                        config_path: config_path.to_string(),
+                                                        schema: Some(table_info.cols.clone()),
+                                                        key: Some(table_info.key_columns.clone()),
+                                                    }
+                                                }
                                             }
 
                                             if let Err(e) = replication.info.dump() {
