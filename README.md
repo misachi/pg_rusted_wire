@@ -125,7 +125,9 @@ cargo run --example lrepl -- -u <user> -P <password> -H <host> -d <database> -p 
 ```
 > Replace the placeholders with your actual connection information. Use `cargo run --example lrepl -- -h` for help on available flags and defaults.
 
-Currently, only INSERT operations are supported. Support for UPDATE and DELETE may be added in the future. . Note that only one table can be replicated at a time. This tool is ideal for capturing and auditing table changes or for simple data synchronization tasks.
+Currently, only INSERT operations are fully supported. There is partial support for UPDATE operations -- updates to columns that make the key may be added later. Also, support for DELETEs will be added in the future.
+
+Note that only one table can be replicated at a time. This tool is ideal for capturing and auditing table changes or for simple data synchronization tasks.
 
 
 ### PSQL-Like CLient

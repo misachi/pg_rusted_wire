@@ -1539,7 +1539,68 @@ fn process_logical_repl(
                                             data_buf[state.data_buf_off] = b'\n';
                                             state.data_buf_off += 1;
                                         }
-                                        b'U' => { // UPDATE
+                                        b'U' => {
+                                            // UPDATE
+                                            let msg_id = xlog_data[9];
+
+                                            let mut off = 0;
+                                            if msg_id == b'K' || msg_id == b'O' {
+                                                // Key of the row to be updated
+                                                // let tuple_data = &xlog_data[6..];
+                                                off += 6;
+                                                let col_num: i16 =
+                                                    (&xlog_data[off..off + 2]).get_i16();
+
+                                                // Number of columns with 2 bytes
+                                                off += 2;
+
+                                                // Ignore key updates and REPLICA IDENTITY FULL updates for now
+                                                // Loop through to move offset forward
+                                                for _ in 0..col_num {
+                                                    // Submessage
+                                                    off += 1;
+                                                    let val_len =
+                                                        (&xlog_data[off..off + 4]).get_i32();
+                                                    off += 4;
+                                                    off += val_len as usize;
+                                                }
+                                            } else {
+                                                off += 6; // Move offset to new tuple data
+                                            }
+
+                                            // Go back one byte to read message type('K' or 'O')
+                                            let msg_id = xlog_data[off - 1];
+
+                                            // Handle new tuple data
+                                            if msg_id == b'N' {
+                                                let col_num: i16 =
+                                                    (&xlog_data[off..off + 2]).get_i16();
+
+                                                // Number of columns with 2 bytes
+                                                off += 2;
+                                                for k in 0..col_num {
+                                                    // Submessage
+                                                    off += 1;
+                                                    let val_len =
+                                                        (&xlog_data[off..off + 4]).get_i32();
+                                                    off += 4;
+
+                                                    data_buf[state.data_buf_off
+                                                        ..state.data_buf_off + val_len as usize]
+                                                        .copy_from_slice(
+                                                            &xlog_data[off..off + val_len as usize],
+                                                        );
+                                                    state.data_buf_off += val_len as usize;
+                                                    off += val_len as usize;
+
+                                                    if (k + 1) < col_num {
+                                                        data_buf[state.data_buf_off] = b',';
+                                                        state.data_buf_off += 1;
+                                                    }
+                                                }
+                                                data_buf[state.data_buf_off] = b'\n';
+                                                state.data_buf_off += 1;
+                                            }
                                         }
                                         b'D' => {
                                             // DELETE
