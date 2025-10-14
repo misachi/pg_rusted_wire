@@ -1987,6 +1987,74 @@ mod tests {
     }
 
     #[test]
+    fn test_build_valid_simple_query_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server_handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; BUF_LEN];
+            let resp_msg: &[u8] = b"Q\0\0\0\x16SELECT * FROM foo\0";
+            let bytes_read = stream.read(&mut buf).unwrap();
+
+            assert_eq!(bytes_read, 23);
+            assert_eq!(resp_msg, &buf[..bytes_read]);
+        });
+
+        let mut stream = TcpStream::connect(server_addr).unwrap();
+        let err = send_simple_query(&mut stream, "SELECT * FROM foo");
+        assert!(err.is_none());
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_process_valid_data_rows() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server_handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = BytesMut::new();
+
+            // Dummy table results sent by server has two columns and contains 2 rows
+            buf.put_u8(b'D');
+            buf.put_i32(26);
+            buf.put_i16(2);
+            buf.put_i32(5);
+            buf.put_slice(b"Simba");
+            buf.put_i32(7);
+            buf.put_slice(b"Onyango");
+
+            buf.put_u8(b'D');
+            buf.put_i32(22);
+            buf.put_i16(2);
+            buf.put_i32(3);
+            buf.put_slice(b"Lee");
+            buf.put_i32(5);
+            buf.put_slice(b"Kwach");
+
+            stream.write_all(&buf).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(server_addr).unwrap();
+        let delete_rows = &mut [0u8; OUT_BUF_SIZE];
+        let result_buf = &mut [0u8; OUT_BUF_SIZE];
+        let state = &mut QueryState::new(delete_rows);
+        let row_descr_buf = &mut BytesMut::new();
+        let replication = &mut Replication::new("/");
+
+        process_simple(&mut stream, state, result_buf, row_descr_buf, replication).unwrap();
+
+        let resp_buf: &[u8] = b"Simba|Onyango\nLee|Kwach\n";
+        assert_eq!(&result_buf[..state.data_buf_off], resp_buf);
+        assert_eq!(
+            state.data_buf_off,
+            resp_buf.len(),
+            "Should be 24 bytes given the contents of resp_buf"
+        );
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
     fn test_format_row_desc_and_data_row() {
         let mut row_descr = BytesMut::new();
         // Simulate a RowDescription message with two columns, names "id" and "name"
