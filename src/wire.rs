@@ -21,6 +21,7 @@ use crate::auth::*;
 const REPLICATION_META_FILE: &str = "meta.json";
 const REPLICATION_DATA_FILE_EXT: &str = ".data";
 const WAIT_OFF_CPU: u64 = 50; // In milliseconds
+const OUT_BUF_SIZE: usize = 4096; // Bytes
 
 #[derive(Debug)]
 pub struct SimpleQueryError(pub String);
@@ -68,6 +69,7 @@ impl TableInfo {
 pub trait DoIO {
     fn write(&self, data: &[u8]) -> io::Result<()>;
     fn read(&self, data: &mut [u8], pos: u64) -> io::Result<usize>;
+    fn delete(&self, data: &[u8]) -> io::Result<()>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +89,33 @@ impl Default for OutResource {
 }
 
 impl DoIO for OutResource {
+    fn delete(&self, data: &[u8]) -> io::Result<()> {
+        match self {
+            OutResource::Iceberg {
+                config_path,
+                schema,
+                key,
+            } => Python::attach(|py| {
+                let py_app = CString::new(read_to_string(Path::new("pyiceberg.py"))?)?;
+                let app: Py<PyAny> =
+                    PyModule::from_code(py, py_app.as_c_str(), c_str!("pyiceberg.py"), c_str!(""))?
+                        .getattr("delete_from_table")?
+                        .into();
+
+                app.call1(
+                    py,
+                    (data, Path::new(config_path), schema.clone(), key.clone()),
+                )?;
+
+                Ok(())
+            }),
+            _ => {
+                // No delete for other types
+                Ok(())
+            }
+        }
+    }
+
     fn write(&self, data: &[u8]) -> io::Result<()> {
         match self {
             OutResource::CSVFile(path) => {
@@ -397,7 +426,7 @@ impl Replication {
                     table_info.snapshot_done = true;
                     self.info.dump().expect("Error saving state");
 
-                    self.write_to(&out_res, &result_buf, &state);
+                    self.write_to(&out_res, &result_buf, &mut state);
                     break;
                 }
                 Ok(SimpleQueryCompletion::InProgress) => {
@@ -410,7 +439,7 @@ impl Replication {
 
                     let out_res = table_info.out_resource.clone();
 
-                    self.write_to(&out_res, &result_buf, &state);
+                    self.write_to(&out_res, &result_buf, &mut state);
                 }
                 Ok(SimpleQueryCompletion::InProgressReadStream) => {
                     let table_info: &mut TableInfo;
@@ -422,7 +451,7 @@ impl Replication {
 
                     let out_res = table_info.out_resource.clone();
 
-                    self.write_to(&out_res, &result_buf, &state);
+                    self.write_to(&out_res, &result_buf, &mut state);
                 }
                 Ok(SimpleQueryCompletion::CommandError) => {
                     break;
@@ -445,7 +474,7 @@ impl Replication {
         Ok(())
     }
 
-    fn write_to(&mut self, out_res: &OutResource, result_buf: &[u8], state: &QueryState) {
+    fn write_to(&mut self, out_res: &OutResource, result_buf: &[u8], state: &mut QueryState) {
         let mut off = state.data_buf_off;
         if off <= 0 {
             off = state.recycle_buf_off;
@@ -455,8 +484,18 @@ impl Replication {
         if off <= 0 {
             return;
         }
+
         if let Err(e) = out_res.write(&result_buf[..off]) {
-            eprintln!("Error when writing to stdout for DataRow: {}", e);
+            eprintln!("Error when appending rows: {}", e);
+        }
+
+        if state.delete_rows_off > 0 {
+            if let Some(del_buf) = &state.delete_rows {
+                if let Err(e) = out_res.delete(&del_buf[..state.delete_rows_off]) {
+                    eprintln!("Error when deleting rows: {}", e);
+                }
+            }
+            state.delete_rows_off = 0; // Reset after delete
         }
     }
 
@@ -466,23 +505,22 @@ impl Replication {
         stream: &mut std::net::TcpStream,
         table: &str,
     ) -> Result<(), ReplicationError> {
-        let mut result_buf = [0; 4096];
+        let mut result_buf = [0; OUT_BUF_SIZE];
         let mut row_descr = BytesMut::new();
+        let mut delete_rows = [0; OUT_BUF_SIZE]; // Buffer to hold deleted rows
 
-        let mut state = QueryState::default();
-        let table_info: &TableInfo;
+        let mut state = QueryState::new(delete_rows.as_mut());
+        // let table_info: &TableInfo;
+        let msg: String;
 
         if let Some(info) = self.info.table.get(table) {
-            table_info = info;
+            msg = String::from(format!(
+                "START_REPLICATION SLOT {} LOGICAL {} (proto_version '4', publication_names '{}')",
+                info.slot, self.info.start_lsn, info.publication
+            ));
         } else {
             return Err(ReplicationError(format!("Table does not exist")));
         }
-        let out_res = table_info.out_resource.clone();
-
-        let msg = String::from(format!(
-            "START_REPLICATION SLOT {} LOGICAL {} (proto_version '4', publication_names '{}')",
-            table_info.slot, self.info.start_lsn, table_info.publication
-        ));
 
         if let Some(e) = send_simple_query(stream, &msg) {
             return Err(ReplicationError(format!(
@@ -494,15 +532,9 @@ impl Replication {
         loop {
             match process_simple(stream, &mut state, &mut result_buf, &mut row_descr, self) {
                 Ok(SimpleQueryCompletion::CommandComplete) => break,
-                Ok(SimpleQueryCompletion::CopyComplete) => {
-                    self.write_to(&out_res, &result_buf, &state)
-                }
-                Ok(SimpleQueryCompletion::InProgress) => {
-                    self.write_to(&out_res, &result_buf, &state)
-                }
-                Ok(SimpleQueryCompletion::InProgressReadStream) => {
-                    self.write_to(&out_res, &result_buf, &state)
-                }
+                Ok(SimpleQueryCompletion::CopyComplete) => (),
+                Ok(SimpleQueryCompletion::InProgress) => (),
+                Ok(SimpleQueryCompletion::InProgressReadStream) => (),
                 Ok(SimpleQueryCompletion::CommandError) => {
                     break;
                 }
@@ -518,7 +550,12 @@ impl Replication {
                         e
                     )));
                 }
-                _ => (),
+                _ => continue,
+            }
+
+            if let Some(info) = self.info.table.get(table) {
+                let out_res = &info.out_resource.clone();
+                self.write_to(&out_res, &result_buf, &mut state);
             }
 
             result_buf.fill(0);
@@ -531,15 +568,17 @@ impl Replication {
     }
 }
 
-pub struct QueryState {
+pub struct QueryState<'a> {
     pub overflowed: bool,
     pub skip_bytes: u32,
     pub overflow_buf: BytesMut,
     pub data_buf_off: usize,
+    delete_rows: Option<&'a mut [u8]>,
+    delete_rows_off: usize,
     recycle_buf_off: usize,
 }
 
-impl Default for QueryState {
+impl Default for QueryState<'_> {
     fn default() -> Self {
         Self {
             overflowed: false,
@@ -547,6 +586,17 @@ impl Default for QueryState {
             overflow_buf: BytesMut::with_capacity(BUF_LEN),
             data_buf_off: 0,
             recycle_buf_off: 0,
+            delete_rows: None,
+            delete_rows_off: 0,
+        }
+    }
+}
+
+impl<'a> QueryState<'a> {
+    fn new(delete_rows: &'a mut [u8]) -> QueryState<'a> {
+        Self {
+            delete_rows: Some(delete_rows),
+            ..Default::default()
         }
     }
 }
@@ -742,6 +792,7 @@ impl Client {
         out_res: Option<OutResource>,
     ) {
         let replication = self.replication.as_mut().expect("Replication must be set");
+        let table_info: &mut TableInfo;
 
         let out_res = match out_res {
             Some(res) => res,
@@ -755,19 +806,34 @@ impl Client {
 
         if let Some(info) = replication.info.table.get_mut(table) {
             info.out_resource = out_res;
-            replication
-                .info
-                .dump()
-                .expect("Unable to save table details");
+            table_info = info;
         } else {
             let mut info = TableInfo::new(out_res, table);
             info.publication = publication_name.to_string();
             replication.info.table.insert(table.to_string(), info);
-            replication
-                .info
-                .dump()
-                .expect("Unable to save table details");
+            table_info = replication.info.table.get_mut(table).unwrap();
         }
+
+        // Update out_resource with schema and key info if Iceberg
+        match &table_info.out_resource {
+            OutResource::CSVFile(_) => (),
+            OutResource::Iceberg {
+                config_path,
+                schema: _,
+                key: _,
+            } => {
+                table_info.out_resource = OutResource::Iceberg {
+                    config_path: config_path.to_string(),
+                    schema: Some(table_info.cols.clone()),
+                    key: Some(table_info.key_columns.clone()),
+                }
+            }
+        }
+
+        replication
+            .info
+            .dump()
+            .expect("Unable to save table details");
 
         replication.create_slot(stream, table).unwrap();
 
@@ -1604,6 +1670,102 @@ fn process_logical_repl(
                                         }
                                         b'D' => {
                                             // DELETE
+                                            let msg_id = xlog_data[5];
+
+                                            let mut off = 0;
+                                            let add_delimiter_fn =
+                                                |b: u8, data_buf: &mut [u8], state: &mut QueryState<'_>| match &mut state
+                                                    .delete_rows
+                                                {
+                                                    Some(buf) => {
+                                                        if state.delete_rows_off < buf.len() {
+                                                            buf[state.delete_rows_off] = b;
+                                                            state.delete_rows_off += 1;
+                                                            data_buf[state.data_buf_off] = b;
+                                                            state.data_buf_off += 1;
+                                                        } else {
+                                                            eprintln!(
+                                                                "Delete rows buffer overflow. Consider increasing buffer size."
+                                                            );
+                                                        }
+                                                    }
+                                                    None => {
+                                                        eprintln!(
+                                                            "Delete rows buffer not initialized."
+                                                        );
+                                                    }
+                                                };
+
+                                            if msg_id == b'K' {
+                                                // || msg_id == b'O' {
+                                                // Key of the row to be updated
+                                                // let tuple_data = &xlog_data[6..];
+                                                off += 6;
+                                                let col_num: i16 =
+                                                    (&xlog_data[off..off + 2]).get_i16();
+
+                                                // Number of columns with 2 bytes
+                                                off += 2;
+
+                                                // Ignore key updates and REPLICA IDENTITY FULL updates for now
+                                                // Loop through to move offset forward
+                                                for i in 0..col_num {
+                                                    // skip if null
+                                                    if xlog_data[off] != b'n' {
+                                                        off += 1;
+                                                        let val_len =
+                                                            (&xlog_data[off..off + 4]).get_i32();
+
+                                                        off += 4;
+
+                                                        data_buf[state.data_buf_off
+                                                            ..state.data_buf_off
+                                                                + val_len as usize]
+                                                            .copy_from_slice(
+                                                                &xlog_data
+                                                                    [off..off + val_len as usize],
+                                                            );
+
+                                                        match &mut state.delete_rows {
+                                                            Some(buf) => {
+                                                                if state.delete_rows_off
+                                                                    + val_len as usize
+                                                                    >= buf.len()
+                                                                {
+                                                                    eprintln!(
+                                                                        "Delete rows buffer overflow. Consider increasing buffer size."
+                                                                    );
+                                                                } else {
+                                                                    buf[state.delete_rows_off
+                                                                        ..state.delete_rows_off
+                                                                            + val_len as usize]
+                                                                        .copy_from_slice(
+                                                                            &xlog_data[off..off
+                                                                                + val_len as usize],
+                                                                        );
+                                                                    state.delete_rows_off +=
+                                                                        val_len as usize;
+                                                                }
+                                                            }
+                                                            None => {
+                                                                eprintln!(
+                                                                    "Delete rows buffer not initialized."
+                                                                );
+                                                            }
+                                                        }
+
+                                                        state.data_buf_off += val_len as usize;
+                                                        off += val_len as usize;
+                                                    } else {
+                                                        off += 1;
+                                                    }
+
+                                                    if (i + 1) < col_num {
+                                                        add_delimiter_fn(b',', data_buf, state);
+                                                    }
+                                                }
+                                                add_delimiter_fn(b'\n', data_buf, state);
+                                            }
                                         }
                                         b'R' => {
                                             // RELATION: https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-RELATION
@@ -1649,10 +1811,14 @@ fn process_logical_repl(
                                                 // Check if column is part of the key
                                                 // '1' indicates part of key, '0' otherwise
                                                 if xlog_data[off] == 1 {
-                                                    table_info.key_columns.push(
-                                                        String::from_utf8_lossy(parts[0])
-                                                            .to_string(),
-                                                    );
+                                                    let temp = String::from_utf8_lossy(parts[0])
+                                                        .to_string();
+                                                    if !table_info.key_columns.contains(&temp) {
+                                                        table_info.key_columns.push(
+                                                            String::from_utf8_lossy(parts[0])
+                                                                .to_string(),
+                                                        );
+                                                    }
                                                 }
                                                 // 2 ints for column oid and column type modifier and C-string terminator and flags byte
                                                 off += 10 + parts[0].len();

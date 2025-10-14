@@ -125,13 +125,13 @@ cargo run --example lrepl -- -u <user> -P <password> -H <host> -d <database> -p 
 ```
 > Replace the placeholders with your actual connection information. Use `cargo run --example lrepl -- -h` for help on available flags and defaults.
 
-Currently, only INSERT operations are fully supported. There is partial support for UPDATE operations -- updates to columns that make the key may be added later. Also, support for DELETEs will be added in the future.
+Currently, only INSERT and DELETE operations are fully supported. There is partial support for UPDATE operations -- updates to columns that make the key may be added later. ~~Also, support for DELETEs will be added in the future.~~
 
 Note that only one table can be replicated at a time. This tool is ideal for capturing and auditing table changes or for simple data synchronization tasks.
 
 
 ### PSQL-Like CLient
-A simple interactive SQL client, similar to psql, is included as an example. You can use it to connect to your PostgreSQL database and run queries directly from the terminal.
+A simple interactive SQL client, similar to psql, is also included as an example. You can use it to connect to your PostgreSQL database and run queries directly from the terminal.
 
 To start the client, run:
 ```

@@ -1,10 +1,12 @@
 import io
 import sys
-from typing import Any, Optional
+from typing import Any, List, Optional
 from pyiceberg.catalog import load_catalog, Catalog
+from pyiceberg.table import Table, upsert_util
 import sqlalchemy.exc
 import pyarrow as pa
 from pyarrow import csv
+import pyarrow.compute as pc
 
 # S3 access details
 S3_SECRET_KEY = 'pass1234'
@@ -42,14 +44,14 @@ def parse_config_file(file_path: str) -> None:
                     ICEBERG_CATALOG, ICEBERG_SCHEMA, ICEBERG_TABLE = TABLE_NAME.split(
                         '.')
     except FileNotFoundError:
-        print("Configuration file not found. Using default settings.")
+        print('Configuration file not found. Using default settings.')
     except Exception as e:
-        print(f"Error reading configuration file: {e}")
+        print(f'Error reading configuration file: {e}')
         sys.exit(1)
 
 
-def upload_to_iceberg(df: pa.Table, *args: Any) -> None:
-    parse_config_file(args[1])
+def get_table(file_path: str) -> Table:
+    parse_config_file(file_path)
 
     catalog: Catalog = load_catalog(
         ICEBERG_CATALOG,
@@ -66,7 +68,7 @@ def upload_to_iceberg(df: pa.Table, *args: Any) -> None:
     try:
         table = '{}.{}'.format(ICEBERG_SCHEMA, ICEBERG_TABLE)
         if catalog.table_exists(table):
-            tbl = catalog.load_table(table)
+            return catalog.load_table(table)
         else:
             print('Table does not exist')
             sys.exit(1)
@@ -77,36 +79,56 @@ def upload_to_iceberg(df: pa.Table, *args: Any) -> None:
         print('Error accessing S3 storage:', e)
         sys.exit(1)
 
+
+def upload_to_iceberg(df: pa.Table, *args: Any) -> None:
+    tbl: Table = get_table(args[1])
+
     # Ensure the dataframe matches the table schema. If key columns are
     # provided, use them for upsert. If not, use all columns. Also when no
     # columns are provided, use the iceberg table schema. This is applicable
     # when performing the initial snapshot loading.
     schema: Optional[pa.Schema] = None
+    identifier_fields: List[Optional[str]] = []
     if args[3]:
-        schema = tbl.schema().as_arrow()
-        df = df.cast(schema)
-
-        tbl.upsert(df, args[3])
+        schema = tbl.schema()
+        identifier_fields = args[3]
     else:
         source = io.BytesIO(bytes(args[0]))
         df = csv.read_csv(source, read_options=csv.ReadOptions(
             column_names=tbl.metadata.schema().column_names, encoding='utf8')
         )
 
-        schema = tbl.schema().as_arrow()
-        df = df.cast(schema)
-
+        schema = tbl.schema()
         # Use all columns from the iceberg table schema
-        tbl.upsert(df, tbl.metadata.schema().column_names)
+        identifier_fields = tbl.metadata.schema().column_names
+
+    # Remove rows with required fields, that are nulls, from table
+    required_fields = [
+        field.name for field in schema.columns if field.optional is not True]
+
+    print(f'The {required_fields} fields are always required. If any one of the fields is null, the row will be dropped')
+    filter_mask = None
+    for field in required_fields:
+        if filter_mask is None:
+            filter_mask = pc.is_valid(df[field])
+        else:
+            filter_mask = pc.or_(filter_mask, pc.is_valid(df[field]))
+
+    df = df.filter(filter_mask)
+    df = df.cast(schema.as_arrow())
+    tbl.upsert(df, identifier_fields)
 
 
 def write_to_table(*args: Any, **kwargs: Any) -> None:
     if len(args) != 4:
         raise ValueError(
-            "Expected exactly 4 arguments: data, config_file_path, columns and key_columns")
+            'Expected exactly 4 arguments: data, config_file_path, columns and key_columns')
 
     source = io.BytesIO(bytes(args[0]))
     table: Optional[pa.Table] = None
+
+    if len(args[0]) <= 0:
+        raise ValueError('No data to write')
 
     if args[2]:
         table = csv.read_csv(source, read_options=csv.ReadOptions(
@@ -114,3 +136,32 @@ def write_to_table(*args: Any, **kwargs: Any) -> None:
         )
 
     upload_to_iceberg(table, *args)
+
+
+def delete_from_table(*args: Any, **kwargs: Any) -> None:
+    if len(args) != 4:
+        raise ValueError(
+            'Expected exactly 4 arguments: data, config_file_path, columns and key_columns')
+
+    source = io.BytesIO(bytes(args[0]))
+    df: Optional[pa.Table] = None
+    tbl: Optional[Table] = None
+
+    if args[2]:
+        df = csv.read_csv(source, read_options=csv.ReadOptions(
+            column_names=args[2], encoding='utf8')
+        )
+    else:
+        tbl = get_table(args[1])
+        df = csv.read_csv(source, read_options=csv.ReadOptions(
+            column_names=tbl.metadata.schema().column_names, encoding='utf8')
+        )
+
+    if not df:
+        raise ValueError('Nothing to delete')
+
+    if not tbl:
+        tbl = get_table(args[1])
+
+    matched_predicate = upsert_util.create_match_filter(df, args[3])
+    tbl.delete(delete_filter=matched_predicate)
