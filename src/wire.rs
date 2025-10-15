@@ -96,9 +96,9 @@ impl DoIO for OutResource {
                 schema,
                 key,
             } => Python::attach(|py| {
-                let py_app = CString::new(read_to_string(Path::new("pyiceberg.py"))?)?;
+                let py_app = CString::new(read_to_string(Path::new("py_iceberg.py"))?)?;
                 let app: Py<PyAny> =
-                    PyModule::from_code(py, py_app.as_c_str(), c_str!("pyiceberg.py"), c_str!(""))?
+                    PyModule::from_code(py, py_app.as_c_str(), c_str!("py_iceberg.py"), c_str!(""))?
                         .getattr("delete_from_table")?
                         .into();
 
@@ -133,9 +133,9 @@ impl DoIO for OutResource {
                 schema,
                 key,
             } => Python::attach(|py| {
-                let py_app = CString::new(read_to_string(Path::new("pyiceberg.py"))?)?;
+                let py_app = CString::new(read_to_string(Path::new("py_iceberg.py"))?)?;
                 let app: Py<PyAny> =
-                    PyModule::from_code(py, py_app.as_c_str(), c_str!("pyiceberg.py"), c_str!(""))?
+                    PyModule::from_code(py, py_app.as_c_str(), c_str!("py_iceberg.py"), c_str!(""))?
                         .getattr("write_to_table")?
                         .into();
 
