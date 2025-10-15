@@ -50,20 +50,25 @@ def parse_config_file(file_path: str) -> None:
         sys.exit(1)
 
 
-def get_table(file_path: str) -> Table:
+def get_table(file_path: str, catalog: Optional[Catalog]) -> Table:
     parse_config_file(file_path)
 
-    catalog: Catalog = load_catalog(
-        ICEBERG_CATALOG,
-        **{
-            'uri': CATALOG_URI,
-            's3.endpoint': S3_ENDPOINT,
-            'py-io-impl': 'pyiceberg.io.pyarrow.PyArrowFileIO',
-            's3.access-key-id': S3_ACCESS_KEY,
-            's3.secret-access-key': S3_SECRET_KEY,
-            'init_catalog_tables': 'false'
-        }
-    )
+    if not catalog:
+        try:
+            catalog: Catalog = load_catalog(
+                ICEBERG_CATALOG,
+                **{
+                    'uri': CATALOG_URI,
+                    's3.endpoint': S3_ENDPOINT,
+                    'py-io-impl': 'pyiceberg.io.pyarrow.PyArrowFileIO',
+                    's3.access-key-id': S3_ACCESS_KEY,
+                    's3.secret-access-key': S3_SECRET_KEY,
+                    'init_catalog_tables': 'false'
+                }
+            )
+        except ValueError as e:
+            print(f'Catalog error: {e}')
+            sys.exit(1)
 
     try:
         table = '{}.{}'.format(ICEBERG_SCHEMA, ICEBERG_TABLE)
@@ -80,8 +85,8 @@ def get_table(file_path: str) -> Table:
         sys.exit(1)
 
 
-def upload_to_iceberg(df: pa.Table, *args: Any) -> None:
-    tbl: Table = get_table(args[1])
+def upload_to_iceberg(df: pa.Table, *args: Any, **kwargs: Any) -> None:
+    tbl: Table = get_table(args[1], kwargs.get('catalog'))
 
     # Ensure the dataframe matches the table schema. If key columns are
     # provided, use them for upsert. If not, use all columns. Also when no
@@ -135,7 +140,7 @@ def write_to_table(*args: Any, **kwargs: Any) -> None:
             column_names=args[2], encoding='utf8')
         )
 
-    upload_to_iceberg(table, *args)
+    upload_to_iceberg(table, *args, **kwargs)
 
 
 def delete_from_table(*args: Any, **kwargs: Any) -> None:
@@ -152,7 +157,7 @@ def delete_from_table(*args: Any, **kwargs: Any) -> None:
             column_names=args[2], encoding='utf8')
         )
     else:
-        tbl = get_table(args[1])
+        tbl = get_table(args[1], kwargs.get('catalog'))
         df = csv.read_csv(source, read_options=csv.ReadOptions(
             column_names=tbl.metadata.schema().column_names, encoding='utf8')
         )
@@ -161,7 +166,7 @@ def delete_from_table(*args: Any, **kwargs: Any) -> None:
         raise ValueError('Nothing to delete')
 
     if not tbl:
-        tbl = get_table(args[1])
+        tbl = get_table(args[1], kwargs.get('catalog'))
 
     matched_predicate = upsert_util.create_match_filter(df, args[3])
     tbl.delete(delete_filter=matched_predicate)
