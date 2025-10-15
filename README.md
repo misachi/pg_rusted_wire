@@ -9,6 +9,7 @@ Streaming to an iceberg table requires the dependencies listed below
 1. Python shared library `python3-dev` for Ubuntu or `python3-devel` for RPM based distributions
 2. PyIceberg which can be installed with the command `pip install "pyiceberg[s3fs,sql-postgres]"`. Replace `sql-postgres` with a Catalog store of your choice. Check [https://py.iceberg.apache.org/#installation](https://py.iceberg.apache.org/#installation) for more information.
 3. PyArrow. Install with `pip install pyarrow`
+4. Sqlite database. For running tests locally
 
 ## Example Usage
 
