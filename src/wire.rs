@@ -1337,51 +1337,6 @@ pub fn process_simple_query(
     Ok(is_done)
 }
 
-/// When we read incomplete data at the end of the response buffer, we copy the remaining slice to overflow buffer
-/// and set the skip_bytes to the number of bytes we need to skip in the next read
-/// to complete the message. Once we have enough data, we process the overflow buffer
-/// to extract the complete message and copy to the data buffer.
-fn handle_overflowed(
-    data_buf: &mut [u8],
-    state: &mut QueryState,
-    buf: &[u8],
-    size: &mut usize,
-    off: &mut usize,
-    cpy_size: usize,
-) {
-    // What??
-    state.overflow_buf.put_slice(&buf[..cpy_size]);
-    let msg_len: i32 = (&state.overflow_buf[1..5]).get_i32();
-    state.skip_bytes = (msg_len + 1) as u32 - state.skip_bytes;
-
-    *size = if *size >= (state.skip_bytes as usize) {
-        *size - state.skip_bytes as usize
-    } else {
-        0
-    };
-    *off += state.skip_bytes as usize;
-
-    // Account for byte, 4 byte for content size
-    let val_off = 5;
-
-    //TODO: CLean this up. Not looking good
-    let mut buf = BytesMut::with_capacity(state.overflow_buf.len());
-    buf.put_slice(&state.overflow_buf);
-
-    let data: &[u8];
-    if msg_len as usize + 1 < buf.len() {
-        data = &buf[val_off..msg_len as usize + 1];
-    } else {
-        data = &buf[val_off..];
-    }
-    data_buf[state.data_buf_off..state.data_buf_off + data.len()].copy_from_slice(data);
-    state.data_buf_off += data.len();
-
-    state.overflow_buf.clear();
-    state.overflowed = false;
-    state.skip_bytes = 0;
-}
-
 fn process_simple(
     stream: &mut std::net::TcpStream,
     state: &mut QueryState,
@@ -1503,22 +1458,17 @@ fn process_logical_repl(
                         }
                         b'd' => {
                             // 'd' for CopyData
-                            if state.skip_bytes > 0 {
-                                handle_overflowed(
-                                    data_buf, state, &buf, &mut size, &mut off, cpy_size,
-                                );
-                                continue;
-                            }
                             if off + 5 > cpy_size {
-                                state.overflowed = true;
+                                buf_off = cpy_size - off;
                                 state.overflow_buf.clear();
                                 state.overflow_buf.put_slice(&buf[off..cpy_size]);
-                                state.skip_bytes = buf[off..cpy_size].len() as u32;
+                                buf[..buf_off].copy_from_slice(&state.overflow_buf);
+                                state.overflow_buf.clear();
                                 break;
                             }
 
                             let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
-                            if state.data_buf_off + msg_len as usize >= data_buf.len() {
+                            if state.data_buf_off + msg_len as usize + 1 >= data_buf.len() {
                                 // Prevent overflow
                                 state.overflow_buf.clear();
                                 state.overflow_buf.put_slice(&buf[off..cpy_size]);
@@ -1529,338 +1479,19 @@ fn process_logical_repl(
                             }
 
                             if off + msg_len as usize + 1 > cpy_size {
-                                state.overflowed = true;
+                                buf_off = cpy_size - off;
                                 state.overflow_buf.clear();
                                 state.overflow_buf.put_slice(&buf[off..cpy_size]);
-                                state.skip_bytes = buf[off..cpy_size].len() as u32;
+                                buf[..buf_off].copy_from_slice(&state.overflow_buf);
+                                state.overflow_buf.clear();
                                 break;
                             }
 
                             let msg_data = &buf[off + 5..off + msg_len as usize + 1];
-                            match msg_data[0] {
-                                b'k' => {
-                                    // 'k' for Keepalive message
-                                    let end_of_wal = (&msg_data[1..9]).get_i64();
-                                    if msg_data[17] == 1 {
-                                        // Reply requested
-                                        println!("Keepalive reply requested");
-                                        let mut resp_buf = BytesMut::new();
-                                        let now: DateTime<Utc> = Utc::now();
-
-                                        // Respond to keep the connection alive
-                                        resp_buf.put_u8(b'd'); // identify message as CopyData
-                                        let start_pos = resp_buf.len();
-                                        resp_buf.put_i32(0); // Placeholder for length
-                                        resp_buf.put_u8(b'r'); // Standby status update
-                                        resp_buf.put_i64(end_of_wal + 1); // The location of the last WAL byte + 1 received and written to disk in the standby.
-                                        resp_buf.put_i64(end_of_wal + 1); // The location of the last WAL byte + 1 flushed to disk in the standby.
-                                        resp_buf.put_i64(end_of_wal + 1); // The location of the last WAL byte + 1 applied in the standby.
-                                        resp_buf.put_i64(now.timestamp_micros()); // The client's system clock at the time of transmission, as microseconds since midnight on 2000-01-01.
-                                        resp_buf.put_u8(0); // Reply is not required
-
-                                        let total_len = resp_buf[start_pos..].len() as i32;
-                                        add_buf_len(&mut resp_buf, start_pos, total_len);
-
-                                        if let Err(e) = stream.write(&resp_buf) {
-                                            return Err(SimpleQueryError(format!(
-                                                "Failed to write keepalive response to stream: {}",
-                                                e
-                                            )));
-                                        }
-                                    }
-                                }
-                                b'w' => {
-                                    let xlog_data = &msg_data[25..];
-                                    // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html
-                                    match xlog_data[0] {
-                                        b'B' => {
-                                            // BEGIN
-                                            println!("XLogData: BEGIN");
-                                        }
-                                        b'I' => {
-                                            // INSERT
-                                            let tuple_data = &xlog_data[6..];
-                                            let col_num: i16 = (&tuple_data[..2]).get_i16();
-
-                                            // Number of columns
-                                            let mut off = 2;
-                                            for k in 0..col_num {
-                                                // Submessage
-                                                off += 1;
-                                                let val_len = (&tuple_data[off..off + 4]).get_i32();
-                                                off += 4;
-
-                                                data_buf[state.data_buf_off
-                                                    ..state.data_buf_off + val_len as usize]
-                                                    .copy_from_slice(
-                                                        &tuple_data[off..off + val_len as usize],
-                                                    );
-                                                state.data_buf_off += val_len as usize;
-                                                off += val_len as usize;
-
-                                                if (k + 1) < col_num {
-                                                    data_buf[state.data_buf_off] = b',';
-                                                    state.data_buf_off += 1;
-                                                }
-                                            }
-                                            data_buf[state.data_buf_off] = b'\n';
-                                            state.data_buf_off += 1;
-                                        }
-                                        b'U' => {
-                                            // UPDATE
-                                            let msg_id = xlog_data[9];
-
-                                            let mut off = 0;
-                                            if msg_id == b'K' || msg_id == b'O' {
-                                                // Key of the row to be updated
-                                                // let tuple_data = &xlog_data[6..];
-                                                off += 6;
-                                                let col_num: i16 =
-                                                    (&xlog_data[off..off + 2]).get_i16();
-
-                                                // Number of columns with 2 bytes
-                                                off += 2;
-
-                                                // Ignore key updates and REPLICA IDENTITY FULL updates for now
-                                                // Loop through to move offset forward
-                                                for _ in 0..col_num {
-                                                    // Submessage
-                                                    off += 1;
-                                                    let val_len =
-                                                        (&xlog_data[off..off + 4]).get_i32();
-                                                    off += 4;
-                                                    off += val_len as usize;
-                                                }
-                                            } else {
-                                                off += 6; // Move offset to new tuple data
-                                            }
-
-                                            // Go back one byte to read message type('K' or 'O')
-                                            let msg_id = xlog_data[off - 1];
-
-                                            // Handle new tuple data
-                                            if msg_id == b'N' {
-                                                let col_num: i16 =
-                                                    (&xlog_data[off..off + 2]).get_i16();
-
-                                                // Number of columns with 2 bytes
-                                                off += 2;
-                                                for k in 0..col_num {
-                                                    // Submessage
-                                                    off += 1;
-                                                    let val_len =
-                                                        (&xlog_data[off..off + 4]).get_i32();
-                                                    off += 4;
-
-                                                    data_buf[state.data_buf_off
-                                                        ..state.data_buf_off + val_len as usize]
-                                                        .copy_from_slice(
-                                                            &xlog_data[off..off + val_len as usize],
-                                                        );
-                                                    state.data_buf_off += val_len as usize;
-                                                    off += val_len as usize;
-
-                                                    if (k + 1) < col_num {
-                                                        data_buf[state.data_buf_off] = b',';
-                                                        state.data_buf_off += 1;
-                                                    }
-                                                }
-                                                data_buf[state.data_buf_off] = b'\n';
-                                                state.data_buf_off += 1;
-                                            }
-                                        }
-                                        b'D' => {
-                                            // DELETE
-                                            let msg_id = xlog_data[5];
-
-                                            let mut off = 0;
-                                            let add_delimiter_fn =
-                                                |b: u8, data_buf: &mut [u8], state: &mut QueryState<'_>| match &mut state
-                                                    .delete_rows
-                                                {
-                                                    Some(buf) => {
-                                                        if state.delete_rows_off < buf.len() {
-                                                            buf[state.delete_rows_off] = b;
-                                                            state.delete_rows_off += 1;
-                                                            data_buf[state.data_buf_off] = b;
-                                                            state.data_buf_off += 1;
-                                                        } else {
-                                                            eprintln!(
-                                                                "Delete rows buffer overflow. Consider increasing buffer size."
-                                                            );
-                                                        }
-                                                    }
-                                                    None => {
-                                                        eprintln!(
-                                                            "Delete rows buffer not initialized."
-                                                        );
-                                                    }
-                                                };
-
-                                            if msg_id == b'K' {
-                                                // || msg_id == b'O' {
-                                                // Key of the row to be updated
-                                                // let tuple_data = &xlog_data[6..];
-                                                off += 6;
-                                                let col_num: i16 =
-                                                    (&xlog_data[off..off + 2]).get_i16();
-
-                                                // Number of columns with 2 bytes
-                                                off += 2;
-
-                                                // Ignore key updates and REPLICA IDENTITY FULL updates for now
-                                                // Loop through to move offset forward
-                                                for i in 0..col_num {
-                                                    // skip if null
-                                                    if xlog_data[off] != b'n' {
-                                                        off += 1;
-                                                        let val_len =
-                                                            (&xlog_data[off..off + 4]).get_i32();
-
-                                                        off += 4;
-
-                                                        data_buf[state.data_buf_off
-                                                            ..state.data_buf_off
-                                                                + val_len as usize]
-                                                            .copy_from_slice(
-                                                                &xlog_data
-                                                                    [off..off + val_len as usize],
-                                                            );
-
-                                                        match &mut state.delete_rows {
-                                                            Some(buf) => {
-                                                                if state.delete_rows_off
-                                                                    + val_len as usize
-                                                                    >= buf.len()
-                                                                {
-                                                                    eprintln!(
-                                                                        "Delete rows buffer overflow. Consider increasing buffer size."
-                                                                    );
-                                                                } else {
-                                                                    buf[state.delete_rows_off
-                                                                        ..state.delete_rows_off
-                                                                            + val_len as usize]
-                                                                        .copy_from_slice(
-                                                                            &xlog_data[off..off
-                                                                                + val_len as usize],
-                                                                        );
-                                                                    state.delete_rows_off +=
-                                                                        val_len as usize;
-                                                                }
-                                                            }
-                                                            None => {
-                                                                eprintln!(
-                                                                    "Delete rows buffer not initialized."
-                                                                );
-                                                            }
-                                                        }
-
-                                                        state.data_buf_off += val_len as usize;
-                                                        off += val_len as usize;
-                                                    } else {
-                                                        off += 1;
-                                                    }
-
-                                                    if (i + 1) < col_num {
-                                                        add_delimiter_fn(b',', data_buf, state);
-                                                    }
-                                                }
-                                                add_delimiter_fn(b'\n', data_buf, state);
-                                            }
-                                        }
-                                        b'R' => {
-                                            // RELATION: https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-RELATION
-                                            // Assume non-streamed transactions, so TransactionId is ignored
-                                            let oid = (&xlog_data[1..5]).get_i32();
-                                            let parts: &Vec<&[u8]> =
-                                                &xlog_data[5..].split(|&b| b == b'\0').collect();
-                                            let namespace = parts[0];
-                                            let rel_name = parts[1];
-                                            // Adding 8 to account for the 2 c-string terminators
-                                            let mut off = namespace.len() + rel_name.len() + 8;
-                                            let num_cols = (&xlog_data[off..off + 2]).get_i16();
-                                            let table_info: &mut TableInfo;
-
-                                            if let Some(info) = replication.info.table.get_mut(
-                                                &String::from_utf8_lossy(rel_name).to_string(),
-                                            ) {
-                                                table_info = info;
-                                            } else {
-                                                return Err(SimpleQueryError(format!(
-                                                    "Table does not exist"
-                                                )));
-                                            }
-
-                                            table_info.name =
-                                                String::from_utf8_lossy(rel_name).to_string();
-                                            table_info.oid = oid;
-                                            table_info.namespace =
-                                                String::from_utf8_lossy(namespace).to_string();
-                                            table_info.ncols = num_cols;
-                                            table_info.cols.clear();
-
-                                            // Include column number
-                                            off += 2;
-                                            for _ in 0..num_cols {
-                                                let parts: &Vec<&[u8]> = &xlog_data[off + 1..]
-                                                    .split(|&b| b == b'\0')
-                                                    .collect();
-                                                table_info.cols.push(
-                                                    String::from_utf8_lossy(parts[0]).to_string(),
-                                                );
-
-                                                // Check if column is part of the key
-                                                // '1' indicates part of key, '0' otherwise
-                                                if xlog_data[off] == 1 {
-                                                    let temp = String::from_utf8_lossy(parts[0])
-                                                        .to_string();
-                                                    if !table_info.key_columns.contains(&temp) {
-                                                        table_info.key_columns.push(
-                                                            String::from_utf8_lossy(parts[0])
-                                                                .to_string(),
-                                                        );
-                                                    }
-                                                }
-                                                // 2 ints for column oid and column type modifier and C-string terminator and flags byte
-                                                off += 10 + parts[0].len();
-                                            }
-
-                                            // Update out_resource with schema and key info if Iceberg
-                                            match &table_info.out_resource {
-                                                OutResource::CSVFile(_) => (),
-                                                OutResource::Iceberg {
-                                                    config_path,
-                                                    schema: _,
-                                                    key: _,
-                                                } => {
-                                                    table_info.out_resource = OutResource::Iceberg {
-                                                        config_path: config_path.to_string(),
-                                                        schema: Some(table_info.cols.clone()),
-                                                        key: Some(table_info.key_columns.clone()),
-                                                    }
-                                                }
-                                            }
-
-                                            if let Err(e) = replication.info.dump() {
-                                                return Err(SimpleQueryError(format!(
-                                                    "Saving relation data error: {}",
-                                                    e
-                                                )));
-                                            }
-                                        }
-                                        b'C' => {
-                                            // COMMIT
-                                            println!("XLogData: COMMIT");
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                _ => {
-                                    data_buf
-                                        [state.data_buf_off..state.data_buf_off + msg_data.len()]
-                                        .copy_from_slice(msg_data);
-                                    state.data_buf_off += msg_data.len();
-                                }
+                            if let Some(e) =
+                                repl_msgs(stream, data_buf, state, replication, msg_data)
+                            {
+                                return Err(e);
                             }
 
                             size = if size >= (msg_len as usize + 1) {
@@ -1876,22 +1507,13 @@ fn process_logical_repl(
                         }
                         _ => {
                             // Handle incomplete data in read buffer(Alot to improve here)
-                            if state.overflowed {
-                                handle_overflowed(
-                                    data_buf, state, &buf, &mut size, &mut off, cpy_size,
-                                );
-                            } else {
-                                let msg_len: i32 = (&buf[1..5]).get_i32();
-                                eprintln!(
-                                    "Unexpected message type when processing simple query: {:?}",
-                                    String::from_utf8_lossy(&buf[0].to_le_bytes())
-                                );
-                                size = if size >= msg_len as usize {
-                                    size - msg_len as usize
-                                } else {
-                                    0
-                                };
-                            }
+                            eprintln!(
+                                "Unexpected message type when processing simple query: {:?}",
+                                buf[0] as char
+                            );
+
+                            is_done = SimpleQueryCompletion::CommandError;
+                            break 'attempt_read;
                         }
                     }
                 }
@@ -1901,6 +1523,309 @@ fn process_logical_repl(
 
     Ok(is_done)
 }
+
+/// Handle the bulk of CopyData message logic for copying data and
+/// streaming data for logical replication
+fn repl_msgs(
+    stream: &mut TcpStream,
+    data_buf: &mut [u8],
+    state: &mut QueryState<'_>,
+    replication: &mut Replication,
+    msg_data: &[u8],
+) -> Option<SimpleQueryError> {
+    match msg_data[0] {
+        b'k' => {
+            // 'k' for Keepalive message
+            let end_of_wal = (&msg_data[1..9]).get_i64();
+            if msg_data[17] == 1 {
+                // Reply requested
+                println!("Keepalive reply requested");
+                let mut resp_buf = BytesMut::new();
+                let now: DateTime<Utc> = Utc::now();
+
+                // Respond to keep the connection alive
+                resp_buf.put_u8(b'd'); // identify message as CopyData
+                let start_pos = resp_buf.len();
+                resp_buf.put_i32(0); // Placeholder for length
+                resp_buf.put_u8(b'r'); // Standby status update
+                resp_buf.put_i64(end_of_wal + 1); // The location of the last WAL byte + 1 received and written to disk in the standby.
+                resp_buf.put_i64(end_of_wal + 1); // The location of the last WAL byte + 1 flushed to disk in the standby.
+                resp_buf.put_i64(end_of_wal + 1); // The location of the last WAL byte + 1 applied in the standby.
+                resp_buf.put_i64(now.timestamp_micros()); // The client's system clock at the time of transmission, as microseconds since midnight on 2000-01-01.
+                resp_buf.put_u8(0); // Reply is not required
+
+                let total_len = resp_buf[start_pos..].len() as i32;
+                add_buf_len(&mut resp_buf, start_pos, total_len);
+
+                if let Err(e) = stream.write(&resp_buf) {
+                    return Some(SimpleQueryError(format!(
+                        "Failed to write keepalive response to stream: {}",
+                        e
+                    )));
+                }
+            }
+        }
+        b'w' => {
+            let xlog_data = &msg_data[25..];
+            // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html
+            match xlog_data[0] {
+                b'B' => {
+                    // BEGIN
+                    println!("XLogData: BEGIN");
+                }
+                b'I' => {
+                    // INSERT
+                    let tuple_data = &xlog_data[6..];
+                    let col_num: i16 = (&tuple_data[..2]).get_i16();
+
+                    // Number of columns
+                    let mut off = 2;
+                    for k in 0..col_num {
+                        // Submessage
+                        off += 1;
+                        let val_len = (&tuple_data[off..off + 4]).get_i32();
+                        off += 4;
+
+                        data_buf[state.data_buf_off..state.data_buf_off + val_len as usize]
+                            .copy_from_slice(&tuple_data[off..off + val_len as usize]);
+                        state.data_buf_off += val_len as usize;
+                        off += val_len as usize;
+
+                        if (k + 1) < col_num {
+                            data_buf[state.data_buf_off] = b',';
+                            state.data_buf_off += 1;
+                        }
+                    }
+                    data_buf[state.data_buf_off] = b'\n';
+                    state.data_buf_off += 1;
+                }
+                b'U' => {
+                    // UPDATE
+                    let msg_id = xlog_data[9];
+
+                    let mut off = 0;
+                    if msg_id == b'K' || msg_id == b'O' {
+                        // Key of the row to be updated
+                        // let tuple_data = &xlog_data[6..];
+                        off += 6;
+                        let col_num: i16 = (&xlog_data[off..off + 2]).get_i16();
+
+                        // Number of columns with 2 bytes
+                        off += 2;
+
+                        // Ignore key updates and REPLICA IDENTITY FULL updates for now
+                        // Loop through to move offset forward
+                        for _ in 0..col_num {
+                            // Submessage
+                            off += 1;
+                            let val_len = (&xlog_data[off..off + 4]).get_i32();
+                            off += 4;
+                            off += val_len as usize;
+                        }
+                    } else {
+                        off += 6; // Move offset to new tuple data
+                    }
+
+                    // Go back one byte to read message type('K' or 'O')
+                    let msg_id = xlog_data[off - 1];
+
+                    // Handle new tuple data
+                    if msg_id == b'N' {
+                        let col_num: i16 = (&xlog_data[off..off + 2]).get_i16();
+
+                        // Number of columns with 2 bytes
+                        off += 2;
+                        for k in 0..col_num {
+                            // Submessage
+                            off += 1;
+                            let val_len = (&xlog_data[off..off + 4]).get_i32();
+                            off += 4;
+
+                            data_buf[state.data_buf_off..state.data_buf_off + val_len as usize]
+                                .copy_from_slice(&xlog_data[off..off + val_len as usize]);
+                            state.data_buf_off += val_len as usize;
+                            off += val_len as usize;
+
+                            if (k + 1) < col_num {
+                                data_buf[state.data_buf_off] = b',';
+                                state.data_buf_off += 1;
+                            }
+                        }
+                        data_buf[state.data_buf_off] = b'\n';
+                        state.data_buf_off += 1;
+                    }
+                }
+                b'D' => {
+                    // DELETE
+                    let msg_id = xlog_data[5];
+
+                    let mut off = 0;
+                    let add_delimiter_fn =
+                        |b: u8, data_buf: &mut [u8], state: &mut QueryState<'_>| match &mut state
+                            .delete_rows
+                        {
+                            Some(buf) => {
+                                if state.delete_rows_off < buf.len() {
+                                    buf[state.delete_rows_off] = b;
+                                    state.delete_rows_off += 1;
+                                    data_buf[state.data_buf_off] = b;
+                                    state.data_buf_off += 1;
+                                } else {
+                                    eprintln!(
+                                        "Delete rows buffer overflow. Consider increasing buffer size."
+                                    );
+                                }
+                            }
+                            None => {
+                                eprintln!("Delete rows buffer not initialized.");
+                            }
+                        };
+
+                    if msg_id == b'K' {
+                        // || msg_id == b'O' {
+                        // Key of the row to be updated
+                        off += 6;
+                        let col_num: i16 = (&xlog_data[off..off + 2]).get_i16();
+
+                        // Number of columns with 2 bytes
+                        off += 2;
+
+                        // Ignore key updates and REPLICA IDENTITY FULL updates for now
+                        // Loop through to move offset forward
+                        for i in 0..col_num {
+                            // skip if null
+                            if xlog_data[off] != b'n' {
+                                off += 1;
+                                let val_len = (&xlog_data[off..off + 4]).get_i32();
+
+                                off += 4;
+
+                                data_buf[state.data_buf_off..state.data_buf_off + val_len as usize]
+                                    .copy_from_slice(&xlog_data[off..off + val_len as usize]);
+
+                                match &mut state.delete_rows {
+                                    Some(buf) => {
+                                        if state.delete_rows_off + val_len as usize >= buf.len() {
+                                            eprintln!(
+                                                "Delete rows buffer overflow. Consider increasing buffer size."
+                                            );
+                                        } else {
+                                            buf[state.delete_rows_off
+                                                ..state.delete_rows_off + val_len as usize]
+                                                .copy_from_slice(
+                                                    &xlog_data[off..off + val_len as usize],
+                                                );
+                                            state.delete_rows_off += val_len as usize;
+                                        }
+                                    }
+                                    None => {
+                                        eprintln!("Delete rows buffer not initialized.");
+                                    }
+                                }
+
+                                state.data_buf_off += val_len as usize;
+                                off += val_len as usize;
+                            } else {
+                                off += 1;
+                            }
+
+                            if (i + 1) < col_num {
+                                add_delimiter_fn(b',', data_buf, state);
+                            }
+                        }
+                        add_delimiter_fn(b'\n', data_buf, state);
+                    }
+                }
+                b'R' => {
+                    // RELATION: https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-RELATION
+                    // Assume non-streamed transactions, so TransactionId is ignored
+                    let oid = (&xlog_data[1..5]).get_i32();
+                    let parts: &Vec<&[u8]> = &xlog_data[5..].split(|&b| b == b'\0').collect();
+                    let namespace = parts[0];
+                    let rel_name = parts[1];
+                    // Adding 8 to account for the 2 c-string terminators
+                    let mut off = namespace.len() + rel_name.len() + 8;
+                    let num_cols = (&xlog_data[off..off + 2]).get_i16();
+                    let table_info: &mut TableInfo;
+
+                    if let Some(info) = replication
+                        .info
+                        .table
+                        .get_mut(&String::from_utf8_lossy(rel_name).to_string())
+                    {
+                        table_info = info;
+                    } else {
+                        return Some(SimpleQueryError(format!("Table does not exist")));
+                    }
+
+                    table_info.name = String::from_utf8_lossy(rel_name).to_string();
+                    table_info.oid = oid;
+                    table_info.namespace = String::from_utf8_lossy(namespace).to_string();
+                    table_info.ncols = num_cols;
+                    table_info.cols.clear();
+
+                    // Include column number
+                    off += 2;
+                    for _ in 0..num_cols {
+                        let parts: &Vec<&[u8]> =
+                            &xlog_data[off + 1..].split(|&b| b == b'\0').collect();
+                        table_info
+                            .cols
+                            .push(String::from_utf8_lossy(parts[0]).to_string());
+
+                        // Check if column is part of the key
+                        // '1' indicates part of key, '0' otherwise
+                        if xlog_data[off] == 1 {
+                            let temp = String::from_utf8_lossy(parts[0]).to_string();
+                            if !table_info.key_columns.contains(&temp) {
+                                table_info
+                                    .key_columns
+                                    .push(String::from_utf8_lossy(parts[0]).to_string());
+                            }
+                        }
+                        // 2 ints for column oid and column type modifier and C-string terminator and flags byte
+                        off += 10 + parts[0].len();
+                    }
+
+                    // Update out_resource with schema and key info if Iceberg
+                    match &table_info.out_resource {
+                        OutResource::CSVFile(_) => (),
+                        OutResource::Iceberg {
+                            config_path,
+                            schema: _,
+                            key: _,
+                        } => {
+                            table_info.out_resource = OutResource::Iceberg {
+                                config_path: config_path.to_string(),
+                                schema: Some(table_info.cols.clone()),
+                                key: Some(table_info.key_columns.clone()),
+                            }
+                        }
+                    }
+
+                    if let Err(e) = replication.info.dump() {
+                        return Some(SimpleQueryError(format!(
+                            "Saving relation data error: {}",
+                            e
+                        )));
+                    }
+                }
+                b'C' => {
+                    // COMMIT
+                    println!("XLogData: COMMIT");
+                }
+                _ => {}
+            }
+        }
+        _ => {
+            data_buf[state.data_buf_off..state.data_buf_off + msg_data.len()]
+                .copy_from_slice(msg_data);
+            state.data_buf_off += msg_data.len();
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::{net::TcpListener, thread};
