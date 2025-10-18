@@ -478,6 +478,7 @@ impl Replication {
         let mut off = state.data_buf_off;
         if off <= 0 {
             off = state.recycle_buf_off;
+            state.recycle_buf_off = 0;
         }
 
         // Ignore if no data to write
