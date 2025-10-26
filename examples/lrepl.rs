@@ -63,7 +63,12 @@ fn main() {
             //     &mut stream,
             //     &args.table,
             //     &args.publication,
-            //     Some(OutResource::Iceberg{config_path: ".tmp/config".to_string(), schema: None, key: None}),
+            //     Some(OutResource::Iceberg {
+            //         config_path: ".tmp/config".to_string(),
+            //         schema: None,
+            //         key: None,
+            //         buffer_opt: BufferOpt::OnDisk{append: None, delete: None},
+            //     }),
             // );
         }
         Err(e) => {

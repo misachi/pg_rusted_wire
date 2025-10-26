@@ -6,22 +6,25 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
-use std::fs::{File, OpenOptions, read_to_string};
-use std::io;
+use std::fs::{File, OpenOptions, create_dir_all, metadata, read_to_string};
 use std::io::{Read, Seek, Write, stdout};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::Path;
+use std::{io, vec};
 use std::{thread, time};
 
 use std::ffi::CString;
-// use std::fs;
 
 use crate::auth::*;
+use crate::segment::{SEGMENT_FILE_EXT, Segment};
 
 const REPLICATION_META_FILE: &str = "meta.json";
 const REPLICATION_DATA_FILE_EXT: &str = ".data";
 const WAIT_OFF_CPU: u64 = 50; // In milliseconds
 const OUT_BUF_SIZE: usize = 4096; // Bytes
+const MAX_SEGMENT_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+const PAGE_SIZE: usize = 4096; // 4 KB
+const MAX_WRITE_INTERVAL: u64 = 60 * 5; // In seconds
 
 #[derive(Debug)]
 pub struct SimpleQueryError(pub String);
@@ -52,11 +55,11 @@ struct TableInfo {
     publication: String,
     snapshot_done: bool,
     key_columns: Vec<String>, // Primary key columns
-    out_resource: OutResource,
+    out_resource: Option<OutResource>,
 }
 
 impl TableInfo {
-    fn new(out_res: OutResource, name: &str) -> Self {
+    fn new(out_res: Option<OutResource>, name: &str) -> Self {
         Self {
             name: name.to_string(),
             slot: format!("{}_slot", name),
@@ -67,9 +70,18 @@ impl TableInfo {
 }
 
 pub trait DoIO {
-    fn write(&self, data: &[u8]) -> io::Result<()>;
+    fn write(&mut self, data: &[u8]) -> io::Result<()>;
     fn read(&self, data: &mut [u8], pos: u64) -> io::Result<usize>;
-    fn delete(&self, data: &[u8]) -> io::Result<()>;
+    fn delete(&mut self, data: &[u8]) -> io::Result<()>;
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum BufferOpt {
+    OnDisk {
+        append: Option<Segment>,
+        delete: Option<Segment>,
+    },
+    InMemory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +91,7 @@ pub enum OutResource {
         config_path: String,
         schema: Option<Vec<String>>,
         key: Option<Vec<String>>,
+        buffer_opt: BufferOpt,
     }, // Path to config file and optional list of key columns
 }
 
@@ -89,26 +102,38 @@ impl Default for OutResource {
 }
 
 impl DoIO for OutResource {
-    fn delete(&self, data: &[u8]) -> io::Result<()> {
+    fn delete(&mut self, data: &[u8]) -> io::Result<()> {
         match self {
             OutResource::Iceberg {
                 config_path,
                 schema,
                 key,
-            } => Python::attach(|py| {
-                let py_app = CString::new(read_to_string(Path::new("py_iceberg.py"))?)?;
-                let app: Py<PyAny> =
-                    PyModule::from_code(py, py_app.as_c_str(), c_str!("py_iceberg.py"), c_str!(""))?
-                        .getattr("delete_from_table")?
-                        .into();
+                buffer_opt,
+            } => match buffer_opt {
+                BufferOpt::OnDisk { append: _, delete } => {
+                    delete.as_mut().unwrap().write(data)?;
 
-                app.call1(
-                    py,
-                    (data, Path::new(config_path), schema.clone(), key.clone()),
-                )?;
+                    Ok(())
+                }
+                BufferOpt::InMemory => Python::attach(|py| {
+                    let py_app = CString::new(read_to_string(Path::new("py_iceberg.py"))?)?;
+                    let app: Py<PyAny> = PyModule::from_code(
+                        py,
+                        py_app.as_c_str(),
+                        c_str!("py_iceberg.py"),
+                        c_str!(""),
+                    )?
+                    .getattr("delete_from_table")?
+                    .into();
 
-                Ok(())
-            }),
+                    app.call1(
+                        py,
+                        (data, Path::new(config_path), schema.clone(), key.clone()),
+                    )?;
+
+                    Ok(())
+                }),
+            },
             _ => {
                 // No delete for other types
                 Ok(())
@@ -116,7 +141,7 @@ impl DoIO for OutResource {
         }
     }
 
-    fn write(&self, data: &[u8]) -> io::Result<()> {
+    fn write(&mut self, data: &[u8]) -> io::Result<()> {
         match self {
             OutResource::CSVFile(path) => {
                 let path = Path::new(&path);
@@ -132,20 +157,33 @@ impl DoIO for OutResource {
                 config_path,
                 schema,
                 key,
-            } => Python::attach(|py| {
-                let py_app = CString::new(read_to_string(Path::new("py_iceberg.py"))?)?;
-                let app: Py<PyAny> =
-                    PyModule::from_code(py, py_app.as_c_str(), c_str!("py_iceberg.py"), c_str!(""))?
-                        .getattr("write_to_table")?
-                        .into();
+                buffer_opt,
+            } => match buffer_opt {
+                BufferOpt::OnDisk { append, delete: _ } => {
+                    // Write data to disk first
+                    append.as_mut().unwrap().write(data)?;
 
-                app.call1(
-                    py,
-                    (data, Path::new(config_path), schema.clone(), key.clone()),
-                )?;
+                    Ok(())
+                }
+                BufferOpt::InMemory => Python::attach(|py| {
+                    // Use data as is
+                    let py_app = CString::new(read_to_string(Path::new("py_iceberg.py"))?)?;
+                    let app: Py<PyAny> = PyModule::from_code(
+                        py,
+                        py_app.as_c_str(),
+                        c_str!("py_iceberg.py"),
+                        c_str!(""),
+                    )?
+                    .getattr("write_to_table")?
+                    .into();
 
-                Ok(())
-            }),
+                    app.call1(
+                        py,
+                        (data, Path::new(config_path), schema.clone(), key.clone()),
+                    )?;
+                    Ok(())
+                }),
+            },
         }
     }
 
@@ -160,6 +198,7 @@ impl DoIO for OutResource {
                 config_path: _,
                 schema: _,
                 key: _,
+                buffer_opt: _,
             } => {
                 // Placeholder for Iceberg read logic
                 Err(io::Error::new(
@@ -167,6 +206,83 @@ impl DoIO for OutResource {
                     "Iceberg read not implemented",
                 ))
             }
+        }
+    }
+}
+
+/// Append all completed segments in the specified directory to the Iceberg table
+/// This will typically be run periodically as a background task in a separate thread
+fn _append_to_iceberg(
+    dir: &str,
+    config_path: &str,
+    schema: Option<&Vec<String>>,
+    key: Option<&Vec<String>>,
+) {
+    let file_entries = get_sorted_file_list_in_dir(dir).expect("Unable to read files in dir");
+    let mut data = vec![0u8; MAX_SEGMENT_SIZE as usize];
+
+    for entry in file_entries {
+        let file_name = entry.file_name().into_string().unwrap();
+        if file_name.ends_with(SEGMENT_FILE_EXT) {
+            let path = Path::new(dir).join(&file_name);
+
+            let mut seg = Segment::from_file_name(&path.to_string_lossy())
+                .expect("Error loading segment from file");
+
+            // Has the segment been merged already or is still being written to?
+            // Also, is the segment still active and within the write interval? If so, skip it
+            if seg.has_merged
+                || (!seg.read_only
+                    && seg
+                        .last_write_interval()
+                        .expect("Error getting last write interval")
+                        .as_secs()
+                        < MAX_WRITE_INTERVAL)
+            {
+                continue;
+            }
+
+            let mut handle = File::open(&path).expect("failed to open segment file");
+            let _ = handle.seek(io::SeekFrom::Start(PAGE_SIZE as u64));
+            let _ = handle.read(&mut data);
+
+            let file_len = metadata(&path).expect("Unable to get file metadata").len();
+            let mut offset = 0;
+            if let Some(pos) = seg.last_written_pos {
+                offset = pos;
+            }
+
+            Python::attach(|py| {
+                let py_app =
+                    CString::new(read_to_string(Path::new("py_iceberg.py")).unwrap()).unwrap();
+                let app: Py<PyAny> =
+                    PyModule::from_code(py, py_app.as_c_str(), c_str!("py_iceberg.py"), c_str!(""))
+                        .unwrap()
+                        .getattr("write_to_table")
+                        .unwrap()
+                        .into();
+
+                app.call1(
+                    py,
+                    (
+                        &data[offset as usize..file_len as usize - PAGE_SIZE],
+                        Path::new(config_path),
+                        schema.clone(),
+                        key.clone(),
+                    ),
+                )
+                .unwrap();
+            });
+
+            // If segment size is above MAX_SEGMENT_SIZE limit, it has been fully merged
+            if seg.size >= MAX_SEGMENT_SIZE {
+                seg.has_merged = true;
+            }
+            // Update segment write position and time metadata
+            seg.last_written_time = Some(std::time::SystemTime::now());
+            seg.last_written_pos = Some(seg.size);
+            seg.write_header()
+                .expect("Error updating segment header after uploading to Iceberg");
         }
     }
 }
@@ -227,7 +343,7 @@ impl ReplicationInfo {
     // Save replication state to file
     fn dump(&self) -> io::Result<()> {
         let path = Path::new(&self.meta_file_path);
-        let mut buf = [0; BUF_LEN];
+        let mut buf = [0; PAGE_SIZE];
 
         let mut handle = File::create(path)?;
 
@@ -414,44 +530,20 @@ impl Replication {
             match process_simple(stream, &mut state, &mut result_buf, &mut row_descr, self) {
                 Ok(SimpleQueryCompletion::CommandComplete) => break,
                 Ok(SimpleQueryCompletion::CopyComplete) => {
-                    let table_info: &mut TableInfo;
                     if let Some(info) = self.info.table.get_mut(table) {
-                        table_info = info;
+                        info.snapshot_done = true;
+                        self.write_to(table, &result_buf, &mut state);
+                        self.info.dump().expect("Error saving state");
                     } else {
                         return Err(ReplicationError(format!("Table does not exist")));
                     }
-
-                    let out_res = table_info.out_resource.clone();
-
-                    table_info.snapshot_done = true;
-                    self.info.dump().expect("Error saving state");
-
-                    self.write_to(&out_res, &result_buf, &mut state);
                     break;
                 }
                 Ok(SimpleQueryCompletion::InProgress) => {
-                    let table_info: &mut TableInfo;
-                    if let Some(info) = self.info.table.get_mut(table) {
-                        table_info = info;
-                    } else {
-                        return Err(ReplicationError(format!("Table does not exist")));
-                    }
-
-                    let out_res = table_info.out_resource.clone();
-
-                    self.write_to(&out_res, &result_buf, &mut state);
+                    self.write_to(table, &result_buf, &mut state);
                 }
                 Ok(SimpleQueryCompletion::InProgressReadStream) => {
-                    let table_info: &mut TableInfo;
-                    if let Some(info) = self.info.table.get_mut(table) {
-                        table_info = info;
-                    } else {
-                        return Err(ReplicationError(format!("Table does not exist")));
-                    }
-
-                    let out_res = table_info.out_resource.clone();
-
-                    self.write_to(&out_res, &result_buf, &mut state);
+                    self.write_to(table, &result_buf, &mut state);
                 }
                 Ok(SimpleQueryCompletion::CommandError) => {
                     break;
@@ -474,7 +566,7 @@ impl Replication {
         Ok(())
     }
 
-    fn write_to(&mut self, out_res: &OutResource, result_buf: &[u8], state: &mut QueryState) {
+    fn write_to(&mut self, table: &str, result_buf: &[u8], state: &mut QueryState) {
         let mut off = state.data_buf_off;
         if off <= 0 {
             off = state.recycle_buf_off;
@@ -486,17 +578,103 @@ impl Replication {
             return;
         }
 
-        if let Err(e) = out_res.write(&result_buf[..off]) {
-            eprintln!("Error when appending rows: {}", e);
-        }
+        if let Some(info) = self.info.table.get_mut(table) {
+            if let Some(out_res) = &mut info.out_resource {
+                match out_res {
+                    OutResource::Iceberg {
+                        config_path,
+                        schema: _,
+                        key: _,
+                        buffer_opt,
+                    } => match buffer_opt {
+                        BufferOpt::OnDisk { append, delete } => {
+                            let mut new_append_seg = append.clone();
+                            let mut new_delete_seg = delete.clone();
 
-        if state.delete_rows_off > 0 {
-            if let Some(del_buf) = &state.delete_rows {
-                if let Err(e) = out_res.delete(&del_buf[..state.delete_rows_off]) {
-                    eprintln!("Error when deleting rows: {}", e);
+                            // Check if current append segment has enough space, if not create a new segment
+                            if let Some(seg) = new_append_seg.as_mut() {
+                                if seg.size + off as u64 > MAX_SEGMENT_SIZE {
+                                    // Mark current full append segment as immutable and flush to disk
+                                    seg.read_only = true;
+                                    if let Err(e) = seg.write_header() {
+                                        eprintln!("Error writing append segment header: {}", e);
+                                        return;
+                                    }
+                                    let new_seg = Segment::new(seg.id + 1, seg.data_dir.clone());
+
+                                    if let Err(e) = new_seg.write_header() {
+                                        eprintln!(
+                                            "Error when creating a new append segment: {}",
+                                            e
+                                        );
+                                        return;
+                                    }
+
+                                    new_append_seg = Some(new_seg);
+                                }
+                            }
+
+                            // Check if current delete segment has  enough space, if not create a new segment
+                            if let Some(seg) = new_delete_seg.as_mut() {
+                                if seg.size + off as u64 > MAX_SEGMENT_SIZE {
+                                    // Mark current full delete segment as immutable and flush to disk
+                                    seg.read_only = true;
+                                    if let Err(e) = seg.write_header() {
+                                        eprintln!("Error writing delete segment header: {}", e);
+                                        return;
+                                    }
+                                    let new_seg = Segment::new(seg.id + 1, seg.data_dir.clone());
+
+                                    if let Err(e) = new_seg.write_header() {
+                                        eprintln!(
+                                            "Error when creating a new delete segment: {}",
+                                            e
+                                        );
+                                        return;
+                                    }
+
+                                    new_delete_seg = Some(new_seg);
+                                }
+                            }
+
+                            info.out_resource = Some(OutResource::Iceberg {
+                                config_path: config_path.to_string(),
+                                schema: info.cols.clone().into(),
+                                key: info.key_columns.clone().into(),
+                                buffer_opt: BufferOpt::OnDisk {
+                                    append: new_append_seg,
+                                    delete: new_delete_seg,
+                                },
+                            });
+                        }
+                        _ => (),
+                    },
+                    _ => (),
                 }
             }
-            state.delete_rows_off = 0; // Reset after delete
+
+            if let Err(e) = info
+                .out_resource
+                .as_mut()
+                .unwrap()
+                .write(&result_buf[..off])
+            {
+                eprintln!("Error when appending rows: {}", e);
+            }
+
+            if state.delete_rows_off > 0 {
+                if let Some(del_buf) = &state.delete_rows {
+                    if let Err(e) = info
+                        .out_resource
+                        .as_mut()
+                        .unwrap()
+                        .delete(&del_buf[..state.delete_rows_off])
+                    {
+                        eprintln!("Error when deleting rows: {}", e);
+                    }
+                }
+                state.delete_rows_off = 0; // Reset after delete
+            }
         }
     }
 
@@ -511,7 +689,6 @@ impl Replication {
         let mut delete_rows = [0; OUT_BUF_SIZE]; // Buffer to hold deleted rows
 
         let mut state = QueryState::new(delete_rows.as_mut());
-        // let table_info: &TableInfo;
         let msg: String;
 
         if let Some(info) = self.info.table.get(table) {
@@ -554,16 +731,19 @@ impl Replication {
                 _ => continue,
             }
 
-            if let Some(info) = self.info.table.get(table) {
-                let out_res = &info.out_resource.clone();
-                self.write_to(&out_res, &result_buf, &mut state);
+            if state.data_buf_off <= 0 && state.skip_bytes <= 0 {
+                // Slow down a bit to avoid busy waiting before attempting to read again
+                thread::sleep(time::Duration::from_millis(WAIT_OFF_CPU));
+                continue;
             }
+
+            self.write_to(table, &result_buf, &mut state);
 
             result_buf.fill(0);
             row_descr.clear();
 
             // Slow down a bit to avoid busy waiting
-            thread::sleep(time::Duration::from_millis(WAIT_OFF_CPU));
+            // thread::sleep(time::Duration::from_millis(WAIT_OFF_CPU));
         }
         Ok(())
     }
@@ -608,6 +788,40 @@ pub struct Client {
     port: u16,
     replication: Option<Replication>,
     startup: StartupMsg,
+}
+
+/// Get a sorted list of files in a directory
+fn get_sorted_file_list_in_dir(dir: &str) -> io::Result<Vec<std::fs::DirEntry>> {
+    let mut entries: Vec<std::fs::DirEntry> =
+        std::fs::read_dir(dir)?.filter_map(Result::ok).collect();
+
+    // Sort entries by file name
+    entries.sort_by_key(|entry| entry.file_name());
+
+    Ok(entries)
+}
+
+fn get_parsed_file_name(file_name: &str) -> Option<u64> {
+    let parts: Vec<&str> = file_name.split('.').collect();
+    if parts.len() >= 2 {
+        if let Ok(id) = parts[0].parse::<u64>() {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// Generate the next segement ID from the newest file in the directory
+fn get_next_segment_id(dir: &str) -> u64 {
+    let file_entries = get_sorted_file_list_in_dir(dir).expect("Unable to read segment dir");
+    let mut next_id: u64 = 1;
+    if file_entries.len() > 0 {
+        let last_file = file_entries.last().unwrap();
+        if let Some(id) = get_parsed_file_name(&last_file.file_name().to_str().unwrap()) {
+            next_id = id + 1;
+        }
+    }
+    next_id
 }
 
 impl Client {
@@ -795,39 +1009,95 @@ impl Client {
         let replication = self.replication.as_mut().expect("Replication must be set");
         let table_info: &mut TableInfo;
 
-        let out_res = match out_res {
-            Some(res) => res,
-            None => OutResource::CSVFile(format!(
-                "{}/{}{}",
-                replication.config_dir.as_ref().unwrap(),
-                table,
-                REPLICATION_DATA_FILE_EXT
-            )),
-        };
+        let data_dir = Path::new(
+            replication
+                .config_dir
+                .as_ref()
+                .expect("Config dir must be set"),
+        );
+        let append_dir = Path::new(data_dir).join(table).join("append");
+        let delete_dir = Path::new(data_dir).join(table).join("delete");
 
         if let Some(info) = replication.info.table.get_mut(table) {
-            info.out_resource = out_res;
             table_info = info;
         } else {
-            let mut info = TableInfo::new(out_res, table);
+            let mut res = out_res;
+
+            create_dir_all(&append_dir).expect("Unable to create table append dir");
+            create_dir_all(&delete_dir).expect("Unable to create table delete dir");
+
+            if res.is_none() {
+                // Default to CSV file
+                res = Some(OutResource::CSVFile(format!(
+                    "{}/{}{}",
+                    append_dir.to_str().unwrap(),
+                    table,
+                    REPLICATION_DATA_FILE_EXT
+                )));
+            }
+            let mut info = TableInfo::new(res, table);
             info.publication = publication_name.to_string();
             replication.info.table.insert(table.to_string(), info);
             table_info = replication.info.table.get_mut(table).unwrap();
         }
 
         // Update out_resource with schema and key info if Iceberg
-        match &table_info.out_resource {
-            OutResource::CSVFile(_) => (),
-            OutResource::Iceberg {
-                config_path,
-                schema: _,
-                key: _,
-            } => {
-                table_info.out_resource = OutResource::Iceberg {
-                    config_path: config_path.to_string(),
-                    schema: Some(table_info.cols.clone()),
-                    key: Some(table_info.key_columns.clone()),
-                }
+        if let Some(res) = &table_info.out_resource {
+            match res {
+                OutResource::CSVFile(_) => (),
+                OutResource::Iceberg {
+                    config_path,
+                    schema: _,
+                    key: _,
+                    buffer_opt,
+                } => match buffer_opt {
+                    // If on-disk buffer, ensure segments are created and configured properly
+                    BufferOpt::OnDisk { append, delete } => {
+                        let mut append_seg = append.clone();
+                        let mut delete_seg = delete.clone();
+
+                        // append_to_iceberg(
+                        //     append_dir.to_str().unwrap(),
+                        //     &config_path,
+                        //     Some(table_info.cols.as_ref()),
+                        //     Some(table_info.key_columns.as_ref()),
+                        // );
+
+                        if let None = append_seg {
+                            let next_id = get_next_segment_id(append_dir.to_str().unwrap());
+                            append_seg = Some(Segment::new(
+                                next_id,
+                                append_dir.to_str().unwrap().to_string(),
+                            ));
+                        }
+
+                        if let None = delete_seg {
+                            let next_id = get_next_segment_id(delete_dir.to_str().unwrap());
+                            delete_seg = Some(Segment::new(
+                                next_id,
+                                delete_dir.to_str().unwrap().to_string(),
+                            ));
+                        }
+
+                        table_info.out_resource = Some(OutResource::Iceberg {
+                            config_path: config_path.to_string(),
+                            schema: Some(table_info.cols.clone()),
+                            key: Some(table_info.key_columns.clone()),
+                            buffer_opt: BufferOpt::OnDisk {
+                                append: append_seg,
+                                delete: delete_seg,
+                            },
+                        });
+                    }
+                    BufferOpt::InMemory => {
+                        table_info.out_resource = Some(OutResource::Iceberg {
+                            config_path: config_path.to_string(),
+                            schema: Some(table_info.cols.clone()),
+                            key: Some(table_info.key_columns.clone()),
+                            buffer_opt: buffer_opt.clone(),
+                        });
+                    }
+                },
             }
         }
 
@@ -1370,6 +1640,7 @@ fn process_logical_repl(
             .copy_from_slice(&state.overflow_buf[..state.skip_bytes as usize]);
         buf_off += state.skip_bytes as usize;
         state.skip_bytes = 0;
+        state.overflow_buf.clear();
     }
 
     'attempt_read: loop {
@@ -1460,7 +1731,7 @@ fn process_logical_repl(
                             // 'd' for CopyData
                             if off + 5 > cpy_size {
                                 buf_off = cpy_size - off;
-                                state.overflow_buf.clear();
+                                // state.overflow_buf.clear();
                                 state.overflow_buf.put_slice(&buf[off..cpy_size]);
                                 buf[..buf_off].copy_from_slice(&state.overflow_buf);
                                 state.overflow_buf.clear();
@@ -1470,7 +1741,7 @@ fn process_logical_repl(
                             let msg_len: i32 = (&buf[off + 1..off + 5]).get_i32();
                             if state.data_buf_off + msg_len as usize + 1 >= data_buf.len() {
                                 // Prevent overflow
-                                state.overflow_buf.clear();
+                                // state.overflow_buf.clear();
                                 state.overflow_buf.put_slice(&buf[off..cpy_size]);
                                 state.skip_bytes = buf[off..cpy_size].len() as u32;
                                 state.recycle_buf_off = state.data_buf_off;
@@ -1480,7 +1751,7 @@ fn process_logical_repl(
 
                             if off + msg_len as usize + 1 > cpy_size {
                                 buf_off = cpy_size - off;
-                                state.overflow_buf.clear();
+                                // state.overflow_buf.clear();
                                 state.overflow_buf.put_slice(&buf[off..cpy_size]);
                                 buf[..buf_off].copy_from_slice(&state.overflow_buf);
                                 state.overflow_buf.clear();
@@ -1511,7 +1782,6 @@ fn process_logical_repl(
                                 "Unexpected message type when processing simple query: {:?}",
                                 buf[0] as char
                             );
-
                             is_done = SimpleQueryCompletion::CommandError;
                             break 'attempt_read;
                         }
@@ -1788,17 +2058,21 @@ fn repl_msgs(
                     }
 
                     // Update out_resource with schema and key info if Iceberg
-                    match &table_info.out_resource {
-                        OutResource::CSVFile(_) => (),
-                        OutResource::Iceberg {
-                            config_path,
-                            schema: _,
-                            key: _,
-                        } => {
-                            table_info.out_resource = OutResource::Iceberg {
-                                config_path: config_path.to_string(),
-                                schema: Some(table_info.cols.clone()),
-                                key: Some(table_info.key_columns.clone()),
+                    if let Some(res) = &table_info.out_resource {
+                        match res {
+                            OutResource::CSVFile(_) => (),
+                            OutResource::Iceberg {
+                                config_path,
+                                schema: _,
+                                key: _,
+                                buffer_opt,
+                            } => {
+                                table_info.out_resource = Some(OutResource::Iceberg {
+                                    config_path: config_path.to_string(),
+                                    schema: Some(table_info.cols.clone()),
+                                    key: Some(table_info.key_columns.clone()),
+                                    buffer_opt: buffer_opt.clone(),
+                                });
                             }
                         }
                     }

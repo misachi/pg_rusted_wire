@@ -1,0 +1,8 @@
+## What problem are you solving
+Slow writes and Write amplification: Writing data to Iceberg can generate a lot of files. In Iceberg, a manifest file is created for tracking each table data file. Data is stored in immutable append-only formats like parquet, avro. Each update to the table results in a new metadata file, a new snapshot and manifest files. This can cause an explosion of metadata files especially for many smaller writes. It is also very slow as there is network access involved for every write and generation of metatadata files.
+
+The current implementation buffers data, being streamed from Postgres, in memory before writing the same to Iceberg. You can only store so much data in memory before it gets exhausted or OOM'd by the kernel. Secondary storage offers more storage space and is less volatile thus provides more durability guarantees compared to memory: minimize chances of losing data before it is written to Iceberg e.g from power loss, network disruption etc. Re-reading the data from Postgres can solve this but introduces other problems.
+
+## Proposed solution
+Buffering data in same-sized segments on disk. Each table keeps track of it's segments and has only one active segment being written to at a time. Once the active segment reaches a paticular configured size, it is transitioned to read-only and a new segment is created. All read-only segments are then uploaded to Iceberg(this can be done in a separate thread). Optionally, a configured time limit can be used for uploading segments to Iceberg. The condition could be: only upload the segment if the time limit elapses or we hit the segment size limit. If an error occurs, the failing segment can be re-uploaded instead of reading the same data from Postgres.
+

@@ -104,7 +104,12 @@ match client.connect() {
             &mut stream,
             "table_name",
             "publication_name",
-            Some(OutResource::Iceberg{config_path: ".tmp/config".to_string(), schema: None, key: None}), // Provide actual path to the iceberg config file described above
+            Some(OutResource::Iceberg{
+                config_path: ".tmp/config".to_string(), // Provide actual path to the iceberg config file described above
+                schema: None,
+                key: None,
+                buffer_opt: BufferOpt::OnDisk{append: None, delete: None}} // Can be either OnDisk or InMemory buffer
+            ),
         );
 
     }
