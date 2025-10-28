@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
-use std::fs::{File, OpenOptions, create_dir_all, metadata, read_to_string};
+use std::fs::{File, OpenOptions, create_dir_all, read_to_string};
 use std::io::{Read, Seek, Write, stdout};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::Path;
@@ -110,8 +110,31 @@ impl DoIO for OutResource {
                 key,
                 buffer_opt,
             } => match buffer_opt {
-                BufferOpt::OnDisk { append: _, delete } => {
-                    delete.as_mut().unwrap().write(data)?;
+                BufferOpt::OnDisk { append, delete } => {
+                    let _delete = delete.as_mut().unwrap();
+                    let file_path = Path::new(&_delete.data_dir)
+                        .join(format!("{}{}", _delete.id, SEGMENT_FILE_EXT));
+                    let mut seg_updated = false;
+                    if let Ok(seg_on_disk) = Segment::from_file_name(file_path.to_str().unwrap()) {
+                        if _delete.updated_at != seg_on_disk.updated_at {
+                            *_delete = seg_on_disk;
+                            seg_updated = true;
+                        }
+                    }
+
+                    _delete.write(data)?;
+
+                    if seg_updated {
+                        *self = OutResource::Iceberg {
+                            config_path: config_path.to_string(),
+                            schema: schema.clone(),
+                            key: key.clone(),
+                            buffer_opt: BufferOpt::OnDisk {
+                                delete: Some(_delete.clone()),
+                                append: append.clone(),
+                            },
+                        };
+                    }
 
                     Ok(())
                 }
@@ -158,32 +181,59 @@ impl DoIO for OutResource {
                 schema,
                 key,
                 buffer_opt,
-            } => match buffer_opt {
-                BufferOpt::OnDisk { append, delete: _ } => {
-                    // Write data to disk first
-                    append.as_mut().unwrap().write(data)?;
+            } => {
+                match buffer_opt {
+                    BufferOpt::OnDisk { append, delete } => {
+                        // Write data to disk first
+                        let _append = append.as_mut().unwrap();
+                        let file_path = Path::new(&_append.data_dir)
+                            .join(format!("{}{}", _append.id, SEGMENT_FILE_EXT));
+                        let mut seg_updated = false;
+                        if let Ok(seg_on_disk) =
+                            Segment::from_file_name(file_path.to_str().unwrap())
+                        {
+                            if _append.updated_at != seg_on_disk.updated_at {
+                                *_append = seg_on_disk;
+                                seg_updated = true;
+                            }
+                        }
 
-                    Ok(())
+                        _append.write(data)?;
+
+                        if seg_updated {
+                            *self = OutResource::Iceberg {
+                                config_path: config_path.to_string(),
+                                schema: schema.clone(),
+                                key: key.clone(),
+                                buffer_opt: BufferOpt::OnDisk {
+                                    append: Some(_append.clone()),
+                                    delete: delete.clone(),
+                                },
+                            };
+                        }
+
+                        Ok(())
+                    }
+                    BufferOpt::InMemory => Python::attach(|py| {
+                        // Use data as is
+                        let py_app = CString::new(read_to_string(Path::new("py_iceberg.py"))?)?;
+                        let app: Py<PyAny> = PyModule::from_code(
+                            py,
+                            py_app.as_c_str(),
+                            c_str!("py_iceberg.py"),
+                            c_str!(""),
+                        )?
+                        .getattr("write_to_table")?
+                        .into();
+
+                        app.call1(
+                            py,
+                            (data, Path::new(config_path), schema.clone(), key.clone()),
+                        )?;
+                        Ok(())
+                    }),
                 }
-                BufferOpt::InMemory => Python::attach(|py| {
-                    // Use data as is
-                    let py_app = CString::new(read_to_string(Path::new("py_iceberg.py"))?)?;
-                    let app: Py<PyAny> = PyModule::from_code(
-                        py,
-                        py_app.as_c_str(),
-                        c_str!("py_iceberg.py"),
-                        c_str!(""),
-                    )?
-                    .getattr("write_to_table")?
-                    .into();
-
-                    app.call1(
-                        py,
-                        (data, Path::new(config_path), schema.clone(), key.clone()),
-                    )?;
-                    Ok(())
-                }),
-            },
+            }
         }
     }
 
@@ -212,14 +262,14 @@ impl DoIO for OutResource {
 
 /// Append all completed segments in the specified directory to the Iceberg table
 /// This will typically be run periodically as a background task in a separate thread
-fn _append_to_iceberg(
+fn append_to_iceberg(
     dir: &str,
     config_path: &str,
     schema: Option<&Vec<String>>,
     key: Option<&Vec<String>>,
 ) {
     let file_entries = get_sorted_file_list_in_dir(dir).expect("Unable to read files in dir");
-    let mut data = vec![0u8; MAX_SEGMENT_SIZE as usize];
+    // let mut data = vec![0u8; MAX_SEGMENT_SIZE as usize];
 
     for entry in file_entries {
         let file_name = entry.file_name().into_string().unwrap();
@@ -242,15 +292,22 @@ fn _append_to_iceberg(
                 continue;
             }
 
-            let mut handle = File::open(&path).expect("failed to open segment file");
-            let _ = handle.seek(io::SeekFrom::Start(PAGE_SIZE as u64));
-            let _ = handle.read(&mut data);
+            // No data added since last time
+            if let Some(last_written_pos) = seg.last_written_pos {
+                if seg.size == last_written_pos {
+                    continue;
+                }
+            }
 
-            let file_len = metadata(&path).expect("Unable to get file metadata").len();
             let mut offset = 0;
             if let Some(pos) = seg.last_written_pos {
-                offset = pos;
+                offset = pos - PAGE_SIZE as u64;
             }
+
+            // TODO: Clean this up: Allocating on every iteration
+            let data = seg
+                .load_data(offset, (seg.size - offset) as i64)
+                .expect("Unable to load data from segment");
 
             Python::attach(|py| {
                 let py_app =
@@ -262,25 +319,34 @@ fn _append_to_iceberg(
                         .unwrap()
                         .into();
 
-                app.call1(
-                    py,
-                    (
-                        &data[offset as usize..file_len as usize - PAGE_SIZE],
-                        Path::new(config_path),
-                        schema.clone(),
-                        key.clone(),
-                    ),
-                )
-                .unwrap();
+                if data.len() > 0 {
+                    app.call1(
+                        py,
+                        (data, Path::new(config_path), schema.clone(), key.clone()),
+                    )
+                    .unwrap();
+                }
             });
 
+            let seg_on_disk = Segment::from_file_name(&path.to_string_lossy())
+                .expect("Error loading segment from file");
+
+            // Store the position last written to Iceberg. This should be the only place `last_written_pos` is mutated
+            // There is a potential data race here: after reading the last updated, before updating our chnages to disk
+            // and another writer updates the segment header. We can get away with that since we save our last written position
+            // and re-read the saved segment from storage brfore updating it.
+            let pos = seg.size;
+            if seg_on_disk.updated_at != seg.updated_at {
+                seg = seg_on_disk;
+            }
+
             // If segment size is above MAX_SEGMENT_SIZE limit, it has been fully merged
-            if seg.size >= MAX_SEGMENT_SIZE {
+            if pos >= MAX_SEGMENT_SIZE {
                 seg.has_merged = true;
             }
             // Update segment write position and time metadata
             seg.last_written_time = Some(std::time::SystemTime::now());
-            seg.last_written_pos = Some(seg.size);
+            seg.last_written_pos = Some(pos);
             seg.write_header()
                 .expect("Error updating segment header after uploading to Iceberg");
         }
@@ -594,21 +660,10 @@ impl Replication {
                             // Check if current append segment has enough space, if not create a new segment
                             if let Some(seg) = new_append_seg.as_mut() {
                                 if seg.size + off as u64 > MAX_SEGMENT_SIZE {
-                                    // Mark current full append segment as immutable and flush to disk
-                                    seg.read_only = true;
-                                    if let Err(e) = seg.write_header() {
-                                        eprintln!("Error writing append segment header: {}", e);
-                                        return;
-                                    }
-                                    let new_seg = Segment::new(seg.id + 1, seg.data_dir.clone());
-
-                                    if let Err(e) = new_seg.write_header() {
-                                        eprintln!(
-                                            "Error when creating a new append segment: {}",
-                                            e
-                                        );
-                                        return;
-                                    }
+                                    let new_seg = match switch_segment(seg) {
+                                        Some(value) => value,
+                                        None => return,
+                                    };
 
                                     new_append_seg = Some(new_seg);
                                 }
@@ -617,21 +672,10 @@ impl Replication {
                             // Check if current delete segment has  enough space, if not create a new segment
                             if let Some(seg) = new_delete_seg.as_mut() {
                                 if seg.size + off as u64 > MAX_SEGMENT_SIZE {
-                                    // Mark current full delete segment as immutable and flush to disk
-                                    seg.read_only = true;
-                                    if let Err(e) = seg.write_header() {
-                                        eprintln!("Error writing delete segment header: {}", e);
-                                        return;
-                                    }
-                                    let new_seg = Segment::new(seg.id + 1, seg.data_dir.clone());
-
-                                    if let Err(e) = new_seg.write_header() {
-                                        eprintln!(
-                                            "Error when creating a new delete segment: {}",
-                                            e
-                                        );
-                                        return;
-                                    }
+                                    let new_seg = match switch_segment(seg) {
+                                        Some(value) => value,
+                                        None => return,
+                                    };
 
                                     new_delete_seg = Some(new_seg);
                                 }
@@ -674,6 +718,10 @@ impl Replication {
                     }
                 }
                 state.delete_rows_off = 0; // Reset after delete
+            }
+
+            if let Err(e) = self.info.dump() {
+                panic!("Error saving state: {}", e);
             }
         }
     }
@@ -747,6 +795,28 @@ impl Replication {
         }
         Ok(())
     }
+}
+
+fn switch_segment(seg: &mut Segment) -> Option<Segment> {
+    let file_path = Path::new(&seg.data_dir).join(format!("{}{}", seg.id, SEGMENT_FILE_EXT));
+    if let Ok(seg_on_disk) = Segment::from_file_name(file_path.to_str().unwrap()) {
+        if seg.updated_at != seg_on_disk.updated_at {
+            *seg = seg_on_disk;
+        }
+    }
+
+    // Mark current full delete segment as immutable and flush to disk
+    seg.read_only = true;
+    if let Err(e) = seg.write_header() {
+        eprintln!("Error writing append segment header: {}", e);
+        return None;
+    }
+    let mut new_seg = Segment::new(seg.id + 1, seg.data_dir.clone());
+    if let Err(e) = new_seg.write_header() {
+        eprintln!("Error when creating a new append segment: {}", e);
+        return None;
+    }
+    Some(new_seg)
 }
 
 pub struct QueryState<'a> {
@@ -1056,12 +1126,24 @@ impl Client {
                         let mut append_seg = append.clone();
                         let mut delete_seg = delete.clone();
 
-                        // append_to_iceberg(
-                        //     append_dir.to_str().unwrap(),
-                        //     &config_path,
-                        //     Some(table_info.cols.as_ref()),
-                        //     Some(table_info.key_columns.as_ref()),
-                        // );
+                        let a_dir = append_dir.clone();
+                        let c_path = config_path.clone();
+                        let schema = table_info.cols.clone();
+                        let key_columns = table_info.key_columns.clone();
+
+                        // Start background thread to periodically append
+                        // completed segments to Iceberg
+                        thread::spawn(move || {
+                            loop {
+                                append_to_iceberg(
+                                    a_dir.to_str().unwrap(),
+                                    &c_path,
+                                    Some(schema.as_ref()),
+                                    Some(key_columns.as_ref()),
+                                );
+                                thread::sleep(time::Duration::from_secs(MAX_WRITE_INTERVAL));
+                            }
+                        });
 
                         if let None = append_seg {
                             let next_id = get_next_segment_id(append_dir.to_str().unwrap());

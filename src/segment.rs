@@ -18,6 +18,7 @@ pub struct Segment {
     pub(crate) max_size: u64,
     pub(crate) data_dir: String,
     pub(crate) created_at: std::time::SystemTime,
+    pub(crate) updated_at: Option<std::time::SystemTime>,
 }
 
 impl Segment {
@@ -28,6 +29,7 @@ impl Segment {
             read_only: false,
             has_merged: false,
             created_at: std::time::SystemTime::now(),
+            updated_at: None,
             last_written_pos: None,
             last_written_time: None,
             max_size: 10 * 1024 * 1024, // 10 MB
@@ -48,18 +50,20 @@ impl Segment {
         seg
     }
 
-    pub(crate) fn from_file_name(file_name: &str) -> io::Result<Self> {
+    pub(crate) fn from_file_name(file_path: &str) -> io::Result<Self> {
+        let file_name = Path::new(file_path).file_name().unwrap().to_string_lossy();
         let id_str = file_name.trim_end_matches(SEGMENT_FILE_EXT);
         match id_str.parse::<u64>() {
             Ok(_) => {
-                let path = Path::new(&file_name);
                 let mut buf = [0; HEADER_LEN];
-                let mut segment_handle = File::open(path)?;
+                let mut segment_handle = File::open(file_path)?;
 
                 segment_handle.seek(io::SeekFrom::Start(0))?;
                 segment_handle.read_exact(&mut buf)?;
 
-                match Segment::decode(&String::from_utf8_lossy(&buf)) {
+                let data_len = buf.iter().position(|&x| x == 0).unwrap_or(HEADER_LEN);
+
+                match Segment::decode(&String::from_utf8_lossy(&buf[..data_len])) {
                     Ok(segment) => Ok(segment),
                     Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
                 }
@@ -90,12 +94,12 @@ impl Segment {
         Ok(info)
     }
 
-    pub(crate) fn load_data(&self, pos: u64, size: u64) -> io::Result<Vec<u8>> {
+    pub(crate) fn load_data(&self, pos: u64, size: i64) -> io::Result<Vec<u8>> {
         let segment_path = Self::create_path_name(&self.data_dir, self.id);
         let path = Path::new(&segment_path);
         let mut buf: Vec<u8>;
         if size <= 0 {
-            buf = vec![0u8; self.size as usize + HEADER_LEN];
+            buf = vec![0u8; self.size as usize];
         } else {
             buf = vec![0u8; size as usize + HEADER_LEN];
         }
@@ -104,37 +108,38 @@ impl Segment {
         let pos = HEADER_LEN as u64 + pos; // Adjust offset by header length
 
         segment_handle.seek(io::SeekFrom::Start(pos))?;
-        segment_handle.read(&mut buf)?;
+        let nr = segment_handle.read(&mut buf)?;
 
-        Ok(buf)
+        Ok(buf[..nr].to_vec())
     }
 
     // Save replication state to file
     pub(crate) fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        // let path = Path::new(&self.meta_file_path);
         let mut buf = [0; HEADER_LEN];
 
         match self.encode() {
             Ok(serialized_data) => {
                 buf[..serialized_data.as_bytes().len()].copy_from_slice(serialized_data.as_bytes());
-                // handle.write_all(&buf[..serialized_data.as_bytes().len()])?;
-                // handle.sync_all()?; // Flush to disk immediately
                 self.write_to_disk(&buf, data)?;
 
                 self.size += data.len() as u64;
+                self.write_header()?;
                 Ok(())
             }
             Err(e) => Err(e.into()),
         }
     }
 
-    pub(crate) fn write_header(&self) -> io::Result<()> {
+    pub(crate) fn write_header(&mut self) -> io::Result<()> {
         let segment_path = Self::create_path_name(&self.data_dir, self.id);
         let path = Path::new(&segment_path);
         let mut buf = [0; HEADER_LEN];
 
         match self.encode() {
-            Ok(serialized_data) => {
+            Ok(mut serialized_data) => {
+                self.updated_at = Some(std::time::SystemTime::now());
+                serialized_data = self.encode()?;
+
                 buf[..serialized_data.as_bytes().len()].copy_from_slice(serialized_data.as_bytes());
                 let mut segment_handle = OpenOptions::new().write(true).create(true).open(path)?;
 
@@ -165,8 +170,6 @@ impl Segment {
             return Ok(());
         }
 
-        segment_handle.seek(io::SeekFrom::Start(0))?;
-        segment_handle.write(metadata)?;
         segment_handle.seek(io::SeekFrom::Start(self.size))?;
         segment_handle.write(data)?;
 
