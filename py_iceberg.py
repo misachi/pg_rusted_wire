@@ -110,6 +110,8 @@ def upload_to_iceberg(df: pa.Table, *args: Any, **kwargs: Any) -> None:
     # Remove rows with required fields, that are nulls, from table
     required_fields = [
         field.name for field in schema.columns if field.optional is not True]
+    if len(required_fields) <= 0:
+        required_fields = identifier_fields
 
     print(f'The {required_fields} fields are always required. If any one of the fields is null, the row will be dropped')
     filter_mask = None
