@@ -56,20 +56,20 @@ fn main() {
             }
 
             // Start streaming to a local CSV file
-            client.run(&mut stream, &args.table, &args.publication, None);
+            // client.run(&mut stream, &args.table, &args.publication, None);
 
             // Start streaming to an iceberg file
-            // client.run(
-            //     &mut stream,
-            //     &args.table,
-            //     &args.publication,
-            //     Some(OutResource::Iceberg {
-            //         config_path: ".tmp/config".to_string(),
-            //         schema: None,
-            //         key: None,
-            //         buffer_opt: BufferOpt::OnDisk{append: None, delete: None},
-            //     }),
-            // );
+            client.run(
+                &mut stream,
+                &args.table,
+                &args.publication,
+                Some(OutResource::Iceberg {
+                    config_path: ".tmp/config".to_string(),
+                    schema: None,
+                    key: None,
+                    buffer_opt: BufferOpt::OnDisk{append: None, delete: None},
+                }),
+            );
         }
         Err(e) => {
             eprintln!("No stream available for client: {}", e);
