@@ -260,23 +260,26 @@ impl DoIO for OutResource {
     }
 }
 
-/// Append all completed segments in the specified directory to the Iceberg table
+/// Push all completed append and delete segments in the specified directory to the Iceberg table
 /// This will typically be run periodically as a background task in a separate thread
-fn append_to_iceberg(
+fn push_to_iceberg(
     dir: &str,
     config_path: &str,
     schema: Option<&Vec<String>>,
     key: Option<&Vec<String>>,
 ) {
-    let file_entries = get_sorted_file_list_in_dir(dir).expect("Unable to read files in dir");
-    // let mut data = vec![0u8; MAX_SEGMENT_SIZE as usize];
+    let append_dir = Path::new(dir).join("append");
+    let delete_dir = Path::new(dir).join("delete");
+    let mut a_file_entries = get_sorted_file_list_in_dir(&append_dir.to_string_lossy())
+        .expect("Unable to read files in dir");
+    let d_file_entries = get_sorted_file_list_in_dir(&delete_dir.to_string_lossy())
+        .expect("Unable to read files in dir");
+    a_file_entries.extend(d_file_entries);
 
-    for entry in file_entries {
+    for entry in a_file_entries {
         let file_name = entry.file_name().into_string().unwrap();
         if file_name.ends_with(SEGMENT_FILE_EXT) {
-            let path = Path::new(dir).join(&file_name);
-
-            let mut seg = Segment::from_file_name(&path.to_string_lossy())
+            let mut seg = Segment::from_file_name(&entry.path().to_string_lossy())
                 .expect("Error loading segment from file");
 
             // Has the segment been merged already or is still being written to?
@@ -309,13 +312,19 @@ fn append_to_iceberg(
                 .load_data(offset, (seg.size - offset) as i64)
                 .expect("Unable to load data from segment");
 
+            let py_func: &str = if entry.path().to_str().unwrap().contains("append") {
+                "write_to_table"
+            } else {
+                "delete_from_table"
+            };
+
             Python::attach(|py| {
                 let py_app =
                     CString::new(read_to_string(Path::new("py_iceberg.py")).unwrap()).unwrap();
                 let app: Py<PyAny> =
                     PyModule::from_code(py, py_app.as_c_str(), c_str!("py_iceberg.py"), c_str!(""))
                         .unwrap()
-                        .getattr("write_to_table")
+                        .getattr(py_func)
                         .unwrap()
                         .into();
 
@@ -328,7 +337,7 @@ fn append_to_iceberg(
                 }
             });
 
-            let seg_on_disk = Segment::from_file_name(&path.to_string_lossy())
+            let seg_on_disk = Segment::from_file_name(&entry.path().to_string_lossy())
                 .expect("Error loading segment from file");
 
             // Store the position last written to Iceberg. This should be the only place `last_written_pos` is mutated
@@ -1087,6 +1096,7 @@ impl Client {
         );
         let append_dir = Path::new(data_dir).join(table).join("append");
         let delete_dir = Path::new(data_dir).join(table).join("delete");
+        let d_dir = Path::new(data_dir).join(table);
 
         if let Some(info) = replication.info.table.get_mut(table) {
             table_info = info;
@@ -1126,24 +1136,9 @@ impl Client {
                         let mut append_seg = append.clone();
                         let mut delete_seg = delete.clone();
 
-                        let a_dir = append_dir.clone();
                         let c_path = config_path.clone();
                         let schema = table_info.cols.clone();
                         let key_columns = table_info.key_columns.clone();
-
-                        // Start background thread to periodically append
-                        // completed segments to Iceberg
-                        thread::spawn(move || {
-                            loop {
-                                append_to_iceberg(
-                                    a_dir.to_str().unwrap(),
-                                    &c_path,
-                                    Some(schema.as_ref()),
-                                    Some(key_columns.as_ref()),
-                                );
-                                thread::sleep(time::Duration::from_secs(MAX_WRITE_INTERVAL));
-                            }
-                        });
 
                         if let None = append_seg {
                             let next_id = get_next_segment_id(append_dir.to_str().unwrap());
@@ -1160,6 +1155,20 @@ impl Client {
                                 delete_dir.to_str().unwrap().to_string(),
                             ));
                         }
+
+                        // Start background thread to periodically append
+                        // completed segments to Iceberg
+                        thread::spawn(move || {
+                            loop {
+                                push_to_iceberg(
+                                    d_dir.to_str().unwrap(),
+                                    &c_path,
+                                    Some(schema.as_ref()),
+                                    Some(key_columns.as_ref()),
+                                );
+                                thread::sleep(time::Duration::from_secs(MAX_WRITE_INTERVAL));
+                            }
+                        });
 
                         table_info.out_resource = Some(OutResource::Iceberg {
                             config_path: config_path.to_string(),
