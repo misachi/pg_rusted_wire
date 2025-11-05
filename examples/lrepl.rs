@@ -64,7 +64,7 @@ fn main() {
                 &args.table,
                 &args.publication,
                 Some(OutResource::Iceberg {
-                    config_path: args.config_dir,
+                    config_path: format!("{}/config", &args.config_dir),
                     schema: None,
                     key: None,
                     buffer_opt: BufferOpt::OnDisk{append: None, delete: None},
