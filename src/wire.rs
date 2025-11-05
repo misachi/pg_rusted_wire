@@ -24,7 +24,7 @@ const WAIT_OFF_CPU: u64 = 50; // In milliseconds
 const OUT_BUF_SIZE: usize = 4096; // Bytes
 const MAX_SEGMENT_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 const PAGE_SIZE: usize = 4096; // 4 KB
-const MAX_WRITE_INTERVAL: u64 = 60 * 5; // In seconds
+const MAX_WRITE_INTERVAL: u64 = 60 * 2; // In seconds
 
 #[derive(Debug)]
 pub struct SimpleQueryError(pub String);
