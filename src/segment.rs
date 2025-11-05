@@ -36,17 +36,19 @@ impl Segment {
             data_dir: dir,
         };
 
+        let mut buf = [0; HEADER_LEN];
+        let serialized_data = seg.encode().unwrap();
         let path = Self::create_path_name(&seg.data_dir, seg.id);
-
-        let segment_handle = OpenOptions::new()
-            .append(true)
+        buf[..serialized_data.as_bytes().len()].copy_from_slice(serialized_data.as_bytes());
+        let mut segment_handle = OpenOptions::new()
+            .write(true)
             .create(true)
             .open(path)
-            .expect("Error creating segment file");
+            .unwrap();
 
-        segment_handle
-            .sync_all()
-            .expect("Error creating segment file");
+        segment_handle.seek(io::SeekFrom::Start(0)).unwrap();
+        segment_handle.write(&buf).unwrap();
+        segment_handle.sync_all().unwrap();
         seg
     }
 
