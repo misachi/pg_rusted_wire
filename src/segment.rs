@@ -146,7 +146,7 @@ impl Segment {
                 let mut segment_handle = OpenOptions::new().write(true).create(true).open(path)?;
 
                 segment_handle.seek(io::SeekFrom::Start(0))?;
-                segment_handle.write(&buf[..serialized_data.as_bytes().len()])?;
+                segment_handle.write(&buf)?;
                 segment_handle.sync_all()?; // Flush to disk immediately
 
                 Ok(())
